@@ -13,10 +13,10 @@ HardwareSerial Serial1(USART1);
 // 7-sensor array: L3, L2, L1, M0(center), R1, R2, R3
 const uint8_t sensorPins[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
 // Fixed threshold values based on testing - values below threshold indicate black line
-const int sensorThresholds[7] = { 2550, 2880, 3000, 3500, 3150, 3125, 2600 };
+const int sensorThresholds[7] = { 2550, 2700, 2850, 3300, 3150, 2850, 2450 };
 
 // Motor driver pins
-#define PWMA PB13
+#define PWMA PB7
 #define AIN2 PB14
 #define AIN1 PB15
 #define BIN1 PA8

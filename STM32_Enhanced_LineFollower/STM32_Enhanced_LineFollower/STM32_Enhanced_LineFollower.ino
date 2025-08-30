@@ -28,7 +28,7 @@
 
 // ===== SENSOR CONFIGURATION =====
 const uint8_t sensorPins[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
-int sensorThresholds[7] = { 2600, 2950, 3300, 3600, 3300, 3125, 2600 };
+int sensorThresholds[7] = { 2550, 2700, 2850, 3300, 3150, 2850, 2450 };
 int sensorValues[7];
 bool followBlackLine = true;
 
@@ -55,56 +55,27 @@ static std::vector<uint8_t> pins = { PIN1, PIN2 };
 static Stm32F4Dshot dshot;
 static float thrusterValues[2] = { 0.0, 0.0 };
 
-// ===== ENHANCED PID VARIABLES =====
-float Kp = 0.25;          // Increased for faster response
-float Ki = 0.15;          // Reduced to prevent overshoot
-float Kd = 1.2;           // Increased for better stability
-int baseSpeed = 180;      // Base DC motor speed
-float baseThrustPower = 0.35; // Base thruster power
-bool thrustersEnabled = true;
+// ===== PID VARIABLES (match TB6612 main) =====
+float Kp = 0.15;
+float Ki = 0.030;
+float Kd = 0.08;
+int baseSpeed = 140;
+int currentSpeed = 140;
+float error = 0, lastError = 0, integral = 0;
 
-float error = 0, lastError = 0, integral = 0, derivative = 0;
-float pidOutput = 0;
-int linePosition = 0, lastLinePosition = 0;
-
-// ===== TIMING VARIABLES =====
-unsigned long lastPIDTime = 0;
-unsigned long lastSensorTime = 0;
-const unsigned long PID_INTERVAL = 15;    // 66Hz PID loop (faster)
-const unsigned long SENSOR_INTERVAL = 10; // 100Hz sensor reading (faster)
+// ===== TIMING (match TB6612 main) =====
+static const uint32_t UPDATE_RATE = 1000;  // 1 kHz control loop
+unsigned long lastPidTime = 0;
+unsigned long lastSampleTime = 0;
+const unsigned long PID_INTERVAL = 1;
+const unsigned long SENSOR_INTERVAL = 1;
 
 // ===== SYSTEM STATES =====
-enum SystemState {
-  STOPPED,
-  LINE_FOLLOWING,
-  DOTTED_LINE_FORWARD,
-  RECOVERY_BREAK,
-  RECOVERY_REVERSE,
-  RECOVERY_ZIGZAG
-};
-
-SystemState currentState = STOPPED;
-bool lineFollowingActive = false;
-
-// ===== DOTTED LINE HANDLING =====
-unsigned long lineLastSeenTime = 0;
-unsigned long dottedLineTimeout = 800;    // 800ms forward on dotted lines
-bool lineDetected = false;
-int noLineCounter = 0;
-const int NO_LINE_THRESHOLD = 5;          // Consecutive readings without line
-
-// ===== RECOVERY SYSTEM =====
-unsigned long recoveryStartTime = 0;
-unsigned long breakInterval = 150;        // 150ms break before reverse
-unsigned long reverseInterval = 400;      // 400ms reverse movement
-unsigned long zigzagStartTime = 0;
-int zigzagDirection = 1;                   // 1 = right, -1 = left
-unsigned long zigzagSwitchInterval = 300; // 300ms per zigzag direction
-int zigzagSpeed = 120;                     // Zigzag search speed
+// ===== ROBOT STATE/BOOT =====
+unsigned long bootTime = 0;
 
 // ===== MOTOR CONTROL FUNCTIONS =====
 void setLeftMotor(int speed) {
-  speed = constrain(speed, -255, 255);
   
   if (speed >= 0) {
     digitalWrite(AIN1, HIGH);
@@ -114,11 +85,11 @@ void setLeftMotor(int speed) {
     digitalWrite(AIN2, HIGH);
     speed = -speed;
   }
-  analogWrite(PWMA, speed);
+  // Bound PWM only (allow full -255..255 range prior to this point)
+  analogWrite(PWMA, constrain(speed, 0, 255));
 }
 
 void setRightMotor(int speed) {
-  speed = constrain(speed, -255, 255);
   
   if (speed >= 0) {
     digitalWrite(BIN1, HIGH);
@@ -128,161 +99,157 @@ void setRightMotor(int speed) {
     digitalWrite(BIN2, HIGH);
     speed = -speed;
   }
-  analogWrite(PWMB, speed);
+  // Bound PWM only (allow full -255..255 range prior to this point)
+  analogWrite(PWMB, constrain(speed, 0, 255));
 }
 
-void stopAllMotors() {
-  setLeftMotor(0);
-  setRightMotor(0);
-  thrusterValues[0] = 0.0;
-  thrusterValues[1] = 0.0;
-  dshot.write(thrusterValues);
-}
+void stopAllMotors() { setLeftMotor(0); setRightMotor(0); thrusterValues[0]=0.0; thrusterValues[1]=0.0; }
 
-// ===== SENSOR FUNCTIONS =====
-void readSensors() {
+// ===== CURVED SENSOR + 2D ERROR (match TB6612 main) =====
+struct PoseError { float e_lat_mm; float e_yaw_rad; bool valid; };
+struct SensorGeometry { float distance; float angle; float weight; float position; };
+const SensorGeometry sensorGeometry[7] = {
+  { 46.5, 99.27, 6000, 0.0 }, { 23.019, 58.61, 5000, 1000.0 }, { 23.019, 40.66, 4000, 2000.0 },
+  { 0.0, 0.0, 3000, 3000.0 }, { 21.76, -36.69, 2000, 4000.0 }, { 40.966, -72.07, 1000, 5000.0 }, { 64.0, -111.4, 0, 6000.0 }
+};
+#define CURVED_WEIGHT_MULTIPLIER 1.0
+#define CURVED_ARRAY_CENTER 3000.0
+#define LOOKAHEAD_DISTANCE 80.0
+#define CURVATURE_FACTOR 2.5
+#define MIN_SPEED_FACTOR 0.4
+#define MAX_SPEED_FACTOR 1.0
+int MAX_CORRECTION = 400;
+int ERROR_DEADBAND = 10;
+bool lineDetected = false;
+unsigned long lineDetectedTime = 0;
+float currentPosition = 3000;
+bool inDottedLineMode = false;
+unsigned long dottedLineStartTime = 0;
+unsigned long lastLineDetectionTime = 0;
+int dottedLineForwardCount = 0;
+const int MAX_DOTTED_FORWARD_STEPS = 40;
+const unsigned long DOTTED_LINE_TIMEOUT = 800;
+bool leftEdgeDetected = false;
+bool rightEdgeDetected = false;
+unsigned long leftEdgeTime = 0;
+unsigned long rightEdgeTime = 0;
+int lastTurnDirection = 0;
+bool inRecoveryMode = false;
+unsigned long recoveryStartTime = 0;
+
+PoseError calculate2DError() {
+  PoseError result = { 0.0, 0.0, false };
+  float totalWeight = 0, weightedX = 0, weightedY = 0; int activeCount = 0;
   for (int i = 0; i < 7; i++) {
-    sensorValues[i] = analogRead(sensorPins[i]);
-  }
-  
-  linePosition = calculateLinePosition();
-  checkLineDetection();
-}
-
-int calculateLinePosition() {
-  int weightedSum = 0;
-  int activeSensors = 0;
-  
-  // Enhanced weighted average with center bias
-  int weights[7] = { -35, -25, -15, 0, 15, 25, 35 };
-  
-  for (int i = 0; i < 7; i++) {
-    bool sensorTriggered;
-    if (followBlackLine) {
-      sensorTriggered = (sensorValues[i] < sensorThresholds[i]);
-    } else {
-      sensorTriggered = (sensorValues[i] > sensorThresholds[i]);
-    }
-    
-    if (sensorTriggered) {
-      weightedSum += weights[i];
-      activeSensors++;
+    int value = analogRead(sensorPins[i]);
+    if (value < sensorThresholds[i]) {
+      activeCount++;
+      float angleRad = sensorGeometry[i].angle * PI / 180.0;
+      float x = sensorGeometry[i].distance * cos(angleRad);
+      float y = sensorGeometry[i].distance * sin(angleRad);
+      float weight = sensorGeometry[i].weight;
+      if (i == 0 || i == 6) weight *= CURVED_WEIGHT_MULTIPLIER * 1.5;
+      else if (i == 1 || i == 5) weight *= CURVED_WEIGHT_MULTIPLIER * 1.2;
+      else if (i == 2 || i == 4) weight *= CURVED_WEIGHT_MULTIPLIER;
+      weightedX += x * weight; weightedY += y * weight; totalWeight += weight;
+      if (i == 0 || i == 1) { leftEdgeDetected = true; leftEdgeTime = millis(); }
+      if (i == 5 || i == 6) { rightEdgeDetected = true; rightEdgeTime = millis(); }
     }
   }
-  
-  if (activeSensors == 0) {
-    return lastLinePosition; // No line detected
+  if (activeCount > 0 && totalWeight > 0) {
+    float centroidX = weightedX / totalWeight; float centroidY = weightedY / totalWeight;
+    result.e_lat_mm = -centroidY;
+    result.e_yaw_rad = atan2(centroidY, centroidX + 50.0);
+    result.valid = true;
   }
-  
-  return weightedSum / activeSensors;
+  return result;
 }
 
-void checkLineDetection() {
-  int activeSensors = 0;
-  
-  for (int i = 0; i < 7; i++) {
-    bool sensorTriggered;
-    if (followBlackLine) {
-      sensorTriggered = (sensorValues[i] < sensorThresholds[i]);
-    } else {
-      sensorTriggered = (sensorValues[i] > sensorThresholds[i]);
-    }
-    
-    if (sensorTriggered) {
-      activeSensors++;
-    }
-  }
-  
-  if (activeSensors > 0) {
-    lineDetected = true;
-    lineLastSeenTime = millis();
-    noLineCounter = 0;
-  } else {
-    lineDetected = false;
-    noLineCounter++;
-  }
+float readLinePosition() {
+  PoseError pe = calculate2DError();
+  if (pe.valid) { float position = CURVED_ARRAY_CENTER - (pe.e_lat_mm * 10.0); return constrain(position, 0, 6000); }
+  return -1;
 }
 
-// ===== ENHANCED PID CONTROLLER =====
-void updatePID() {
-  error = linePosition;
-  
-  // Enhanced integral calculation with windup protection
-  integral += error;
-  integral = constrain(integral, -50, 50); // Tighter integral limits
-  
-  // Enhanced derivative calculation with smoothing
-  derivative = error - lastError;
-  
-  // Advanced PID calculation with derivative kick prevention
-  pidOutput = Kp * error + Ki * integral + Kd * derivative;
-  
-  // Dynamic PID output limiting based on speed
-  float maxOutput = baseSpeed * 0.8;
-  pidOutput = constrain(pidOutput, -maxOutput, maxOutput);
-  
-  lastError = error;
+void updateAdaptiveSpeed(float headingError) {
+  float absHeadingError = fabs(headingError);
+  float speedFactor = 1.0f / (1.0f + CURVATURE_FACTOR * absHeadingError);
+  speedFactor = constrain(speedFactor, MIN_SPEED_FACTOR, MAX_SPEED_FACTOR);
+  currentSpeed = (int)(baseSpeed * speedFactor);
 }
 
-// ===== LINE FOLLOWING CONTROL =====
+float calculateMixedError(const PoseError& pe) { return pe.e_lat_mm + (LOOKAHEAD_DISTANCE * pe.e_yaw_rad * 180.0 / PI); }
+
+// PID is computed inline in executeLineFollowing using TB6612 pattern
+
+// ===== MAIN LINE FOLLOWING LOGIC (TB6612) =====
 void executeLineFollowing() {
-  // Calculate motor speeds with enhanced response
-  int leftSpeed = baseSpeed + pidOutput;
-  int rightSpeed = baseSpeed - pidOutput;
-  
-  // Apply speed limits
-  leftSpeed = constrain(leftSpeed, 0, 255);
-  rightSpeed = constrain(rightSpeed, 0, 255);
-  
-  // Set DC motors
-  setLeftMotor(leftSpeed);
-  setRightMotor(rightSpeed);
-  
-  // Enhanced thruster control
-  if (thrustersEnabled) {
-    float leftThrust = baseThrustPower;
-    float rightThrust = baseThrustPower;
-    
-    // Position-based thrust adjustment
-    float positionFactor = abs(linePosition) / 35.0;
-    
-    // Dynamic thrust for turning assistance
-    if (linePosition > 5) { // Turn right
-      leftThrust += (positionFactor * 0.4);
-      rightThrust -= (positionFactor * 0.2);
-    } else if (linePosition < -5) { // Turn left
-      rightThrust += (positionFactor * 0.4);
-      leftThrust -= (positionFactor * 0.2);
-    }
-    
-    // Speed-based thrust boost
-    float avgSpeed = (leftSpeed + rightSpeed) / 2.0;
-    float speedFactor = avgSpeed / 255.0;
-    leftThrust *= (0.7 + speedFactor * 0.3);
-    rightThrust *= (0.7 + speedFactor * 0.3);
-    
-    // Apply thrust limits
-    thrusterValues[0] = constrain(leftThrust, 0.0, 1.0);
-    thrusterValues[1] = constrain(rightThrust, 0.0, 1.0);
-  } else {
-    thrusterValues[0] = 0.0;
-    thrusterValues[1] = 0.0;
+  unsigned long currentTime = millis();
+  PoseError poseError = { 0.0, 0.0, false };
+  if (currentTime - lastSampleTime >= SENSOR_INTERVAL) {
+    lastSampleTime = currentTime;
+    poseError = calculate2DError();
+    if (poseError.valid) {
+      currentPosition = CURVED_ARRAY_CENTER - (poseError.e_lat_mm * 10.0);
+      currentPosition = constrain(currentPosition, 0, 6000);
+      lineDetected = true; lineDetectedTime = currentTime; lastLineDetectionTime = currentTime;
+    } else { lineDetected = false; }
   }
-  
-  dshot.write(thrusterValues);
+  if (currentTime - lastPidTime >= PID_INTERVAL) {
+    lastPidTime = currentTime;
+    if (lineDetected && (currentTime - lineDetectedTime) < 100) {
+      inRecoveryMode = false;
+      if (poseError.valid) {
+        error = calculateMixedError(poseError);
+        updateAdaptiveSpeed(poseError.e_yaw_rad);
+        if (abs(error) < ERROR_DEADBAND) { error = 0; integral = 0; }
+        if (poseError.e_lat_mm < -20.0) lastTurnDirection = -1; else if (poseError.e_lat_mm > 20.0) lastTurnDirection = 1;
+      } else { error = CURVED_ARRAY_CENTER - currentPosition; currentSpeed = baseSpeed; }
+      float deltaTime = PID_INTERVAL / 1000.0f; integral += error * deltaTime; integral = constrain(integral, -500, 500);
+      float derivative = (error - lastError) / deltaTime; float rawCorrection = Kp * error + Ki * integral + Kd * derivative;
+      float correction = constrain(rawCorrection, -MAX_CORRECTION, MAX_CORRECTION); lastError = error;
+      int leftSpeed = currentSpeed - correction; int rightSpeed = currentSpeed + correction;
+      // ESC throttle update based on error magnitude (match TB6612 style)
+      float errorMagnitude = abs(error);
+      if (errorMagnitude < ERROR_DEADBAND) { thrusterValues[0] = 0.5; thrusterValues[1] = 0.5; }
+      else if (errorMagnitude < 100) { float baseT = 0.6f; float adj = correction / 1200.0f; thrusterValues[0] = constrain(baseT - adj, 0.4, 0.9); thrusterValues[1] = constrain(baseT + adj, 0.4, 0.9); }
+      else { float baseT = 0.7f; float adj = correction / 1000.0f; thrusterValues[0] = constrain(baseT - adj, 0.4, 0.9); thrusterValues[1] = constrain(baseT + adj, 0.4, 0.9); }
+      setLeftMotor(constrain(leftSpeed, -255, 255)); setRightMotor(constrain(rightSpeed, -255, 255));
+    } else {
+      // Dotted line handling + recovery (TB6612)
+      // Enter dotted line mode check
+      // Reuse helper below
+      handleDottedLineMode();
+      if (inDottedLineMode) return;
+      if (!inRecoveryMode) { inRecoveryMode = true; recoveryStartTime = currentTime; }
+      unsigned long timeSinceLoss = currentTime - lineDetectedTime;
+      if (timeSinceLoss < 2000) {
+        bool recentLeft = leftEdgeDetected && (currentTime - leftEdgeTime) < 500;
+        bool recentRight = rightEdgeDetected && (currentTime - rightEdgeTime) < 500;
+        if (recentLeft && !recentRight) { leftMotor(-200); rightMotor(200); lastTurnDirection = -1; }
+        else if (recentRight && !recentLeft) { leftMotor(200); rightMotor(-200); lastTurnDirection = 1; }
+        else if (lastTurnDirection == -1) { if (timeSinceLoss < 500) { leftMotor(-200); rightMotor(200); } else { leftMotor(50); rightMotor(200); } }
+        else if (lastTurnDirection == 1) { if (timeSinceLoss < 500) { leftMotor(200); rightMotor(-200); } else { leftMotor(200); rightMotor(50); } }
+        else { if (timeSinceLoss < 300) { leftMotor(-200); rightMotor(200); } else if (timeSinceLoss < 600) { leftMotor(200); rightMotor(-200); } else { leftMotor(200); rightMotor(50); } }
+      } else { thrusterValues[0]=0.0; thrusterValues[1]=0.0; stopAllMotors(); integral = 0; currentPosition = CURVED_ARRAY_CENTER; leftEdgeDetected=false; rightEdgeDetected=false; }
+    }
+  }
 }
 
-// ===== DOTTED LINE HANDLING =====
-void handleDottedLine() {
-  // Move forward at base speed when line is not detected
-  setLeftMotor(baseSpeed);
-  setRightMotor(baseSpeed);
-  
-  // Keep thrusters at base power for forward movement
-  if (thrustersEnabled) {
-    thrusterValues[0] = baseThrustPower * 0.8;
-    thrusterValues[1] = baseThrustPower * 0.8;
-    dshot.write(thrusterValues);
+// ===== DOTTED LINE DETECTION =====
+bool detectDottedLinePattern() { unsigned long t=millis(); bool recentlyHadLine=(t-lastLineDetectionTime)<200; return (recentlyHadLine && !lineDetected); }
+void handleDottedLineMode() {
+  unsigned long t=millis(); if (!inDottedLineMode && detectDottedLinePattern()) { inDottedLineMode=true; dottedLineStartTime=t; dottedLineForwardCount=0; }
+  if (inDottedLineMode) {
+    if (lineDetected) { inDottedLineMode=false; return; }
+    if ((t - dottedLineStartTime) > DOTTED_LINE_TIMEOUT) { inDottedLineMode=false; return; }
+    if (dottedLineForwardCount >= MAX_DOTTED_FORWARD_STEPS) { inDottedLineMode=false; return; }
+    dottedLineForwardCount++;
+    float lastKnownError = CURVED_ARRAY_CENTER - currentPosition; float correction = constrain(lastKnownError * 0.5, -200, 200);
+    thrusterValues[0] = 0.7; thrusterValues[1] = 0.7;
+    int forwardSpeed = baseSpeed + 20; int l = forwardSpeed - correction; int r = forwardSpeed + correction;
+    setLeftMotor(constrain(l, 0, 255)); setRightMotor(constrain(r, 0, 255));
+    return;
   }
 }
 
@@ -306,7 +273,7 @@ void executeRecoveryReverse() {
   // Thrusters off during recovery
   thrusterValues[0] = 0.0;
   thrusterValues[1] = 0.0;
-  dshot.write(thrusterValues);
+  // Note: dshot.write() called in main loop timing function
   
   if (millis() - recoveryStartTime > reverseInterval) {
     currentState = RECOVERY_ZIGZAG;
@@ -335,12 +302,20 @@ void executeRecoveryZigzag() {
   // Thrusters off during recovery
   thrusterValues[0] = 0.0;
   thrusterValues[1] = 0.0;
-  dshot.write(thrusterValues);
+  // Note: dshot.write() called in main loop timing function
 }
 
 // ===== STATE MACHINE =====
 void updateStateMachine() {
   switch (currentState) {
+    case ESC_CALIBRATION:
+      if (millis() - bootTime > ESC_CALIBRATION_TIME) {
+        currentState = LINE_FOLLOWING;
+        lineFollowingActive = true;
+        Serial1.println("ESC Calibration complete. Starting line following.");
+      }
+      break;
+      
     case STOPPED:
       stopAllMotors();
       break;
@@ -396,6 +371,14 @@ void updateStateMachine() {
         executeRecoveryZigzag();
       }
       break;
+
+    case MANUAL:
+      // Thrusters off in manual mode
+      thrusterValues[0] = 0.0;
+      thrusterValues[1] = 0.0;
+      setLeftMotor(manualLeftSpeed);
+      setRightMotor(manualRightSpeed);
+      break;
   }
 }
 
@@ -418,6 +401,51 @@ void processSerialCommands() {
       lineFollowingActive = false;
       stopAllMotors();
       Serial1.println("System STOPPED");
+
+    } else if (cmd.equalsIgnoreCase("manual")) {
+      currentState = MANUAL;
+      lineFollowingActive = false;
+      thrustersEnabled = false;
+      manualLeftSpeed = 0;
+      manualRightSpeed = 0;
+      Serial1.println("Manual mode ENABLED");
+
+    } else if (cmd.equalsIgnoreCase("auto")) {
+      currentState = LINE_FOLLOWING;
+      lineFollowingActive = true;
+      Serial1.println("Auto line following ENABLED");
+      
+    } else if (cmd.startsWith("LM=")) {
+      int val = constrain(cmd.substring(3).toInt(), -255, 255);
+      manualLeftSpeed = val;
+      if (currentState == MANUAL) setLeftMotor(manualLeftSpeed);
+      Serial1.print("Left DC motor set to: ");
+      Serial1.println(val);
+
+    } else if (cmd.startsWith("RM=")) {
+      int val = constrain(cmd.substring(3).toInt(), -255, 255);
+      manualRightSpeed = val;
+      if (currentState == MANUAL) setRightMotor(manualRightSpeed);
+      Serial1.print("Right DC motor set to: ");
+      Serial1.println(val);
+
+    } else if (cmd.startsWith("bothdc=")) {
+      int val = constrain(cmd.substring(7).toInt(), -255, 255);
+      manualLeftSpeed = val;
+      manualRightSpeed = val;
+      if (currentState == MANUAL) {
+        setLeftMotor(manualLeftSpeed);
+        setRightMotor(manualRightSpeed);
+      }
+      Serial1.print("Both DC motors set to: ");
+      Serial1.println(val);
+
+    } else if (cmd.equalsIgnoreCase("stopdc")) {
+      manualLeftSpeed = 0;
+      manualRightSpeed = 0;
+      setLeftMotor(0);
+      setRightMotor(0);
+      Serial1.println("Both DC motors STOPPED");
       
     } else if (cmd.startsWith("Kp=")) {
       Kp = cmd.substring(3).toFloat();
@@ -463,12 +491,14 @@ void processSerialCommands() {
     } else if (cmd.equalsIgnoreCase("status")) {
       Serial1.print("State: ");
       switch (currentState) {
+        case ESC_CALIBRATION: Serial1.print("ESC_CALIBRATION"); break;
         case STOPPED: Serial1.print("STOPPED"); break;
         case LINE_FOLLOWING: Serial1.print("LINE_FOLLOWING"); break;
         case DOTTED_LINE_FORWARD: Serial1.print("DOTTED_LINE"); break;
         case RECOVERY_BREAK: Serial1.print("RECOVERY_BREAK"); break;
         case RECOVERY_REVERSE: Serial1.print("RECOVERY_REVERSE"); break;
         case RECOVERY_ZIGZAG: Serial1.print("RECOVERY_ZIGZAG"); break;
+        case MANUAL: Serial1.print("MANUAL"); break;
       }
       Serial1.print(" | Line Pos: ");
       Serial1.print(linePosition);
@@ -478,7 +508,7 @@ void processSerialCommands() {
       Serial1.println(thrustersEnabled ? "ON" : "OFF");
       
     } else {
-      Serial1.println("Commands: start/stop/Kp=val/Ki=val/Kd=val/speed=val/thrust=val/thruster=on|off/pid/status");
+      Serial1.println("Commands: start/stop/manual/auto/LM=n/RM=n/bothdc=n/stopdc/Kp=val/Ki=val/Kd=val/speed=val/thrust=val/thruster=on|off/pid/status");
     }
   }
 }
@@ -492,38 +522,28 @@ extern "C" void DMA2_Stream2_IRQHandler(void) {
   dshot.handleDmaIrqStream2();
 }
 
-// ===== MAIN LOOP TIMING =====
-void runTimedOperations() {
-  unsigned long currentTime = millis();
+// ===== ESC TIMING CONTROL =====
+static void runESCTiming(const uint32_t usec) {
+  static uint32_t prev;
+  const uint32_t UPDATE_RATE = 50;  // 50Hz ESC update rate
   
-  // High-frequency sensor reading (100Hz)
-  if (currentTime - lastSensorTime >= SENSOR_INTERVAL) {
-    lastSensorTime = currentTime;
-    if (lineFollowingActive) {
-      readSensors();
-    }
+  if (usec - prev > 1000000 / UPDATE_RATE) {
+    prev = usec;
+    // Always send ESC commands to maintain DShot communication
+    dshot.write(thrusterValues);
   }
-  
-  // High-frequency PID loop (66Hz)
-  if (currentTime - lastPIDTime >= PID_INTERVAL) {
-    lastPIDTime = currentTime;
-    if (lineFollowingActive && currentState == LINE_FOLLOWING) {
-      updatePID();
-    }
-  }
+}
+
+// ===== CONTROL LOOP GATING (match TB6612 main) =====
+static void runControl(const uint32_t usec) {
+  static uint32_t prev;
+  if (usec - prev > 1000000 / UPDATE_RATE) { prev = usec; executeLineFollowing(); }
 }
 
 // ===== SETUP =====
 void setup() {
   // Initialize ADC resolution
   analogReadResolution(12);
-  
-  // Initialize serial communication
-  Serial1.begin(115200);
-  Serial1.println("=== Enhanced Line Following Robot ===");
-  Serial1.println("Features: Fast PID, Dotted Lines, Recovery System");
-  Serial1.println("Commands: start/stop/Kp=val/Ki=val/Kd=val/speed=val/thrust=val/thruster=on|off/pid/status");
-  Serial1.println("Ready for operation!");
   
   // Initialize sensor pins
   for (int i = 0; i < 7; i++) {
@@ -542,21 +562,14 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
   
-  // Initialize DShot ESCs
   dshot.begin(pins);
-  
-  // Initialize timing
-  lastPIDTime = millis();
-  lastSensorTime = millis();
-  lineLastSeenTime = millis();
+  bootTime = millis();
 }
 
 // ===== MAIN LOOP =====
 void loop() {
-  processSerialCommands();
-  runTimedOperations();
-  updateStateMachine();
+  const auto usec = micros();
   
-  // Small delay for system stability
-  delayMicroseconds(10);
+  runESCTiming(usec);
+  if (millis() - bootTime > 3000) { runControl(usec); }
 }

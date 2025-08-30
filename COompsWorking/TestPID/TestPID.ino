@@ -22,7 +22,7 @@
 #include <vector>
 const uint8_t sensorPins[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
 // Dynamic threshold values - can be updated via web interface
-int sensorThresholds[7] = { 2600, 2950, 3300, 3600, 3300, 3125, 2600 };
+int sensorThresholds[7] = { 2550, 2880, 3000, 3500, 3150, 3125, 2600 };
 int sensorValues[7];
 //ESC pins
 HardwareSerial Serial1(USART1);
@@ -67,9 +67,7 @@ float error = 0, lastError = 0, integral = 0;
 
 // ===== TIMER VARIABLES =====
 unsigned long lastPIDTime = 0;
-unsigned long lastSensorTime = 0;
-const unsigned long PID_INTERVAL = 20;    // 50Hz PID loop
-const unsigned long SENSOR_INTERVAL = 50; // 20Hz sensor reading
+const unsigned long CONTROL_INTERVAL = 20;    // 50Hz control loop (sensors + PID)
 
 // ===== LINE FOLLOWING VARIABLES =====
 int linePosition = 0;
@@ -220,7 +218,7 @@ void updatePID() {
   pidOutput = Kp * error + Ki * integral + Kd * derivative;
   
   // Constrain PID output
-  pidOutput = constrain(pidOutput, -baseSpeed, baseSpeed);
+  pidOutput = constrain(pidOutput, -255, 255);
   
   // Update last error
   lastError = error;
@@ -234,8 +232,8 @@ void applyLineFollowing() {
   int rightSpeed = baseSpeed - pidOutput;
   
   // Constrain speeds
-  leftSpeed = constrain(leftSpeed, 0, 255);
-  rightSpeed = constrain(rightSpeed, 0, 255);
+  leftSpeed = constrain(leftSpeed, -255, 255);
+  rightSpeed = constrain(rightSpeed, -255, 255);
   
   // Apply to DC motors for steering
   leftMotor(leftSpeed);
@@ -550,7 +548,6 @@ void setup(void) {
   
   // Initialize timers
   lastPIDTime = millis();
-  lastSensorTime = millis();
 }
 
 void loop(void) {
@@ -560,18 +557,11 @@ void loop(void) {
   checkSerial();
   run(usec);
   
-  // Timer-based sensor reading (20Hz)
-  if (currentTime - lastSensorTime >= SENSOR_INTERVAL) {
-    lastSensorTime = currentTime;
-    if (lineFollowing) {
-      readSensors();
-    }
-  }
-  
-  // Timer-based PID loop (50Hz)
-  if (currentTime - lastPIDTime >= PID_INTERVAL) {
+  // Combined sensor reading and PID control (50Hz)
+  if (currentTime - lastPIDTime >= CONTROL_INTERVAL) {
     lastPIDTime = currentTime;
     if (lineFollowing) {
+      readSensors();
       updatePID();
       applyLineFollowing();
     }

@@ -4,8 +4,8 @@
 // Adaptive speed control for optimal cornering performance
 // Enhanced edge sensor memory for sharp turn recovery
 // CURVED SENSOR ARRAY OPTIMIZATION - Enhanced for arc-shaped sensor layout
-
-#include <Arduino.h>
+#include <dshot_stm32f4.h>
+#include <HardwareSerial.h>
 #include <vector>
 // Forward declarations of structs
 struct PoseError {
@@ -14,10 +14,38 @@ struct PoseError {
   bool valid;       // True if error calculation is valid
 };
 
+HardwareSerial Serial1(USART1);
+
+// ESC pins (Thrusters)
+static const uint8_t PIN1 = PB8;  // Left Thruster
+static const uint8_t PIN2 = PB9;  // Right Thruster
+
+struct SensorGeometry {
+  float distance;  // Distance from center in mm
+  float angle;     // Angle from center in degrees (positive = left, negative = right)
+  float weight;    // Position weight for line following
+  float position;  // Calculated position value for this sensor
+};
+
+// ===== DSHOT SETUP =====
+static std::vector<uint8_t> pins = { PIN1, PIN2 };
+static Stm32F4Dshot dshot;
+static float thrusterValues[2] = { 0.0, 0.0 };
+
+// ===== DMA INTERRUPT HANDLERS =====
+extern "C" void DMA2_Stream1_IRQHandler(void) {
+  dshot.handleDmaIrqStream1();
+}
+extern "C" void DMA2_Stream2_IRQHandler(void) {
+  dshot.handleDmaIrqStream2();
+}
+
+
+
 // ===== CURVED SENSOR ARRAY GEOMETRY =====
 // 7-sensor array: L3, L2, L1, M0(center), R1, R2, R3
 const uint8_t sensorPins[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
-static const uint32_t UPDATE_RATE = 1000;  // Hz (1 ms) - control loop pacing
+static const uint32_t UPDATE_RATE = 20;  // Hz (1 ms) - control loop pacing
 
 // Curved sensor array constants
 #define CURVED_WEIGHT_MULTIPLIER 1.0
@@ -25,12 +53,6 @@ static const uint32_t UPDATE_RATE = 1000;  // Hz (1 ms) - control loop pacing
 
 // Curved sensor array parameters (inward curve - sensors curve toward robot center)
 // Distances and angles from center (M0) to each sensor
-struct SensorGeometry {
-  float distance;  // Distance from center in mm
-  float angle;     // Angle from center in degrees (positive = left, negative = right)
-  float weight;    // Position weight for line following
-  float position;  // Calculated position value for this sensor
-};
 
 // Curved sensor geometry - corrected calculations
 // Position values are calculated based on sensor spacing and curve geometry
@@ -52,7 +74,7 @@ const SensorGeometry sensorGeometry[7] = {
 };
 
 // Dynamic threshold values - can be updated via web interface
-int sensorThresholds[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
+int sensorThresholds[7] = { 2700, 3200, 3200, 3300, 3200, 3200, 2700 };
 
 // Motor driver pins
 #define PWMA PB7
@@ -70,6 +92,12 @@ int sensorThresholds[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
 #define SAMPLE_INTERVAL 1  // 1ms ultra-fast sensor reading
 #define PID_INTERVAL 1     // 1ms ultra-fast PID for micro-corrections
 
+// ===== THRUST CONTROL CONSTANTS =====
+#define MIN_THRUST 0.2                // Minimum thrust value (20%) - more aggressive range for dramatic differentials
+#define MAX_THRUST 0.9                // Maximum thrust value (90%) - maximum thrust for aggressive maneuvers
+#define BASE_THRUST 0.5               // Base thrust value (50%) - lower base for more range above and below
+#define THRUST_ADJUSTMENT_FACTOR 0.6  // Factor for thrust adjustment based on error - aggressive for quick decisions
+
 // ===== 2D ERROR CALCULATION CONSTANTS =====
 #define LOOKAHEAD_DISTANCE 80.0  // mm - lookahead distance for curvature-aware control
 #define CURVATURE_FACTOR 2.5     // Factor for adaptive speed control based on heading error
@@ -79,14 +107,14 @@ int sensorThresholds[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
 // ===== PID VARIABLES =====
 // Fixed PID values optimized for curved array with 2D control
 float Kp = 0.15;         // Proportional gain (increased for 2D control)
-float Ki = 0.030;        // Integral gain (increased for better tracking)
-float Kd = 0.08;         // Derivative gain (increased for stability)
+float Ki = 0.10;        // Integral gain (increased for better tracking)
+float Kd = 0.3;         // Derivative gain (increased for stability)
 int baseSpeed = 200;     // Base speed (will be modulated by adaptive speed control)
 int currentSpeed = 200;  // Current adaptive speed
 
 // ===== CONTROL PARAMETERS =====
 int MAX_CORRECTION = 400;  // Maximum steering correction
-int ERROR_DEADBAND = 10;   // Deadband to reduce wobbling on straight paths
+int ERROR_DEADBAND = 1;   // Deadband to reduce wobbling on straight paths
 
 float error = 0, lastError = 0, integral = 0;
 unsigned long lastPidTime = 0;
@@ -145,9 +173,9 @@ PoseError calculate2DError() {
       // Apply curved array weighting
       float weight = sensorGeometry[i].weight;
       if (i == 0 || i == 6) {  // Outer sensors
-        weight *= CURVED_WEIGHT_MULTIPLIER * 1.5;
+        weight *= CURVED_WEIGHT_MULTIPLIER * 1;
       } else if (i == 1 || i == 5) {  // Second outer
-        weight *= CURVED_WEIGHT_MULTIPLIER * 1.2;
+        weight *= CURVED_WEIGHT_MULTIPLIER * 1;
       } else if (i == 2 || i == 4) {  // Inner sensors
         weight *= CURVED_WEIGHT_MULTIPLIER;
       }
@@ -364,7 +392,7 @@ void executeLineFollowing() {
       float rawCorrection = Kp * error + Ki * integral + Kd * derivative;
 
       // Limit correction to prevent excessive steering that slows the robot
-      float correction = constrain(rawCorrection, -MAX_CORRECTION, MAX_CORRECTION);
+      float correction = rawCorrection;
 
       lastError = error;
 
@@ -372,7 +400,24 @@ void executeLineFollowing() {
       int leftSpeed = currentSpeed - correction;
       int rightSpeed = currentSpeed + correction;
 
-      // No ESC control: only DC motor speeds are applied
+      // Calculate thrust values based on error and correction
+      float leftThrust = BASE_THRUST;
+      float rightThrust = BASE_THRUST;
+
+      // Always adjust thrust for line following - no minimum threshold for more responsive control
+      float thrustAdjustment = (correction / 800.0) * THRUST_ADJUSTMENT_FACTOR;  // Reduced divisor for more aggressive adjustment
+
+      // Left motor thrust adjustment (inverse relationship for turning)
+      // More aggressive: can go from 0.2 to 0.9 for quick decisions
+      leftThrust = constrain(BASE_THRUST + thrustAdjustment, MIN_THRUST, MAX_THRUST);
+      // Right motor thrust adjustment (inverse relationship for turning)
+      // More aggressive: can go from 0.2 to 0.9 for quick decisions
+      rightThrust = constrain(BASE_THRUST - thrustAdjustment, MIN_THRUST, MAX_THRUST);
+
+      // Apply thrust values to ESC thrusters
+      thrusterValues[0] = leftThrust;   // Left thruster
+      thrusterValues[1] = rightThrust;  // Right thruster
+
 
       // Apply motor speeds with constraints
       leftMotor(constrain(leftSpeed, -255, 255));
@@ -411,39 +456,49 @@ void executeLineFollowing() {
         if (recentLeftEdge && !recentRightEdge) {
           // Left edge was detected recently - immediate sharp left turn
           sharpLeftTurn();
+          setThrustValues(MIN_THRUST, MAX_THRUST);  // Maximum differential: left=0.2, right=0.9 for aggressive left turn
           lastTurnDirection = -1;
         } else if (recentRightEdge && !recentLeftEdge) {
           // Right edge was detected recently - immediate sharp right turn
           sharpRightTurn();
+          setThrustValues(MAX_THRUST, MIN_THRUST);  // Maximum differential: left=0.9, right=0.2 for aggressive right turn
           lastTurnDirection = 1;
         } else if (lastTurnDirection == -1) {
           // Continue left turn with forward motion for faster search
           if (timeSinceLoss < 500) {
-            sharpLeftTurn();  // First 500ms: sharp turn
+            sharpLeftTurn();                                      // First 500ms: sharp turn
+            setThrustValues(MIN_THRUST * 1.5, MAX_THRUST * 0.8);  // Aggressive differential: left=0.3, right=0.72
           } else {
-            fastLeftSearch();  // After 500ms: search while moving forward
+            fastLeftSearch();                                     // After 500ms: search while moving forward
+            setThrustValues(MIN_THRUST * 2.0, MAX_THRUST * 0.7);  // Moderate differential: left=0.4, right=0.63
           }
         } else if (lastTurnDirection == 1) {
           // Continue right turn with forward motion for faster search
           if (timeSinceLoss < 500) {
-            sharpRightTurn();  // First 500ms: sharp turn
+            sharpRightTurn();                                     // First 500ms: sharp turn
+            setThrustValues(MAX_THRUST * 0.8, MIN_THRUST * 1.5);  // Aggressive differential: left=0.72, right=0.3
           } else {
-            fastRightSearch();  // After 500ms: search while moving forward
+            fastRightSearch();                                    // After 500ms: search while moving forward
+            setThrustValues(MAX_THRUST * 0.7, MIN_THRUST * 2.0);  // Moderate differential: left=0.63, right=0.4
           }
         } else {
           // No memory - aggressive search pattern
           if (timeSinceLoss < 300) {
-            sharpLeftTurn();  // Try left first
+            sharpLeftTurn();                                      // Try left first
+            setThrustValues(MIN_THRUST * 1.5, MAX_THRUST * 0.8);  // Aggressive differential: left=0.3, right=0.72
           } else if (timeSinceLoss < 600) {
-            sharpRightTurn();  // Then try right
+            sharpRightTurn();                                     // Then try right
+            setThrustValues(MAX_THRUST * 0.8, MIN_THRUST * 1.5);  // Aggressive differential: left=0.72, right=0.3
           } else {
-            fastLeftSearch();  // Then search left while moving
+            fastLeftSearch();                                     // Then search left while moving
+            setThrustValues(MIN_THRUST * 2.0, MAX_THRUST * 0.7);  // Moderate differential: left=0.4, right=0.63
           }
         }
       } else {
         // Recovery timeout - stop and reset
-        // No ESCs: only stop DC motors
+        // Stop DC motors and disable thrusters
         stopMotors();
+        disableThrusters();
         integral = 0;
         currentPosition = CURVED_ARRAY_CENTER;  // Reset to center position for curved array
         leftEdgeDetected = false;
@@ -463,10 +518,10 @@ bool detectDottedLinePattern() {
   // Check if we recently had line detection (within last 200ms)
   // This indicates we just lost the line after having it, which is typical of dotted lines
   unsigned long currentTime = millis();
-  bool recentlyHadLine = (currentTime - lastLineDetectionTime) < 200;
+  bool recentlyHadLine = (currentTime - lastLineDetectionTime) < 300;
 
   // If we had line recently and now lost it, this might be a dotted line
-  // The 200ms window is chosen because dotted line gaps are typically short
+  // The 300ms window is chosen because dotted line gaps are typically short
   if (recentlyHadLine && !lineDetected) {
     return true;  // This looks like a dotted line pattern
   }
@@ -521,12 +576,15 @@ void handleDottedLineMode() {
     float lastKnownError = CURVED_ARRAY_CENTER - currentPosition;
     float correction = constrain(lastKnownError * 0.5, -200, 200);  // Reduced correction (50% of normal)
 
-    // No ESCs in dotted line mode; maintain DC motor forward motion
-
     // Set forward speed slightly above base for controlled movement
     int forwardSpeed = baseSpeed + 20;           // Base speed + 20 for steady forward motion
     int leftSpeed = forwardSpeed - correction;   // Apply correction to left motor
     int rightSpeed = forwardSpeed + correction;  // Apply correction to right motor
+
+    // Apply moderate thrust during dotted line mode for steady forward movement
+    thrusterValues[0] = BASE_THRUST * 0.8;  // 80% of base thrust for left (0.4)
+    thrusterValues[1] = BASE_THRUST * 0.8;  // 80% of base thrust for right (0.4)
+
 
     // Apply motor speeds with safety constraints
     leftMotor(constrain(leftSpeed, 0, 255));    // Ensure speed is within valid range
@@ -553,8 +611,9 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);  // Turn LED on to indicate ready
 
-  // Brief startup delay
-  delay(1000);
+  // Initialize DShot ESCs
+  dshot.begin(pins);
+
   // Record boot time for delayed control start
   bootTime = millis();
 }
@@ -562,7 +621,7 @@ void setup() {
 
 void loop() {
   const auto usec = micros();
-
+  runESCTiming(usec);
   // Start running control logic 3 seconds after boot
   if (millis() - bootTime > 3000) {
     run();
@@ -571,6 +630,31 @@ void loop() {
 
 
 static void run() {
-
   executeLineFollowing();
+}
+
+// ===== THRUST CONTROL FUNCTIONS =====
+void setThrustValues(float leftThrust, float rightThrust) {
+  thrusterValues[0] = constrain(leftThrust, MIN_THRUST, MAX_THRUST);
+  thrusterValues[1] = constrain(rightThrust, MIN_THRUST, MAX_THRUST);
+
+
+}
+
+void disableThrusters() {
+  thrusterValues[0] = 0.0;
+  thrusterValues[1] = 0.0;
+
+}
+
+// ===== ESC TIMING CONTROL =====
+static void runESCTiming(const uint32_t usec) {
+  static uint32_t prev;
+  const uint32_t UPDATE_RATE = 50;  // 50Hz ESC update rate
+
+  if (usec - prev > 1000000 / UPDATE_RATE) {
+    prev = usec;
+    // Always send ESC commands to maintain DShot communication
+    dshot.write(thrusterValues);
+  }
 }
