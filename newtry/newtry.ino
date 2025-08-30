@@ -19,8 +19,12 @@ static Stm32F4Dshot dshot;
 static float thrusterValues[2] = { 0.0f, 0.0f };
 
 // ===== DMA IRQ for DShot (as per your setup) =====
-extern "C" void DMA2_Stream1_IRQHandler(void) { dshot.handleDmaIrqStream1(); }
-extern "C" void DMA2_Stream2_IRQHandler(void) { dshot.handleDmaIrqStream2(); }
+extern "C" void DMA2_Stream1_IRQHandler(void) {
+  dshot.handleDmaIrqStream1();
+}
+extern "C" void DMA2_Stream2_IRQHandler(void) {
+  dshot.handleDmaIrqStream2();
+}
 
 // ===== Linear Sensor Array =====
 // 7-sensor array: L3, L2, L1, M0, R1, R2, R3
@@ -45,8 +49,8 @@ static const int CENTER_POS = 0;
 #define LED_PIN PC13
 
 // ===== Timers =====
-#define SAMPLE_INTERVAL 5   // ms - INCREASED for stability
-#define PID_INTERVAL    5   // ms - INCREASED for stability
+#define SAMPLE_INTERVAL 5  // ms - INCREASED for stability
+#define PID_INTERVAL 5     // ms - INCREASED for stability
 
 // ===== Thrust control (for BLDC thrusters) =====
 #define MIN_THRUST 0.2f
@@ -55,26 +59,26 @@ static const int CENTER_POS = 0;
 #define THRUST_ADJUSTMENT_FACTOR 0.6f  // how strongly correction changes thrusts
 
 // ===== PID - TUNED FOR NORMALIZED ERROR SCALE =====
-float Kp = 30.0f;        // INCREASED for normalized scale (-3 to +3)
-float Ki = 0.0f;         // START WITH 0 to avoid integral windup
-float Kd = 0.0f;         // START WITH 0, add after P is stable
+float Kp = 3.0f;   // INCREASED for normalized scale (-3 to +3)
+float Ki = 0.15f;  // START WITH 0 to avoid integral windup
+float Kd = 0.2f;   // START WITH 0, add after P is stable
 
-int   baseSpeed    = 200;
-int   currentSpeed = 200;
+int baseSpeed = 160;
+int currentSpeed = 160;
 
-int   MAX_CORRECTION   = 400;
-int   ERROR_DEADBAND   = 0;
+int MAX_CORRECTION = 400;
+int ERROR_DEADBAND = 0;
 
 float error = 0, lastError = 0, integral = 0;
 unsigned long lastPidTime = 0;
 unsigned long lastSampleTime = 0;
 
 // ===== Line/State =====
-bool          lineDetected = false;
+bool lineDetected = false;
 unsigned long lineDetectedTime = 0;
-float         currentPosition  = CENTER_POS;
-int           lastTurnDirection = 0; // -1 left, +1 right, 0 straight
-bool          inRecoveryMode = false;
+float currentPosition = CENTER_POS;
+int lastTurnDirection = 0;  // -1 left, +1 right, 0 straight
+bool inRecoveryMode = false;
 unsigned long recoveryStartTime = 0;
 
 bool robotRunning = true;
@@ -88,8 +92,7 @@ static void executeLineFollowing();
 static void run();
 
 // ===== Normalized linear position reading: -3..+3, or -999 if none =====
-float readLinePositionLinear()
-{
+float readLinePositionLinear() {
   long weightedSum = 0;
   long weight = 0;
   int activeCount = 0;
@@ -99,12 +102,12 @@ float readLinePositionLinear()
     // black line detection: reading below threshold
     if (v < sensorThresholds[i]) {
       weightedSum += (long)SENSOR_POS[i];
-      weight      += 1;
+      weight += 1;
       activeCount++;
     }
   }
 
-  if (activeCount == 0 || weight == 0) return -999.0f; // no line
+  if (activeCount == 0 || weight == 0) return -999.0f;  // no line
   float pos = (float)weightedSum / (float)weight;
   // clamp to bounds
   if (pos < -3.0f) pos = -3.0f;
@@ -114,14 +117,26 @@ float readLinePositionLinear()
 
 // ===== Motor helpers =====
 void leftMotor(int speed) {
-  if (speed >= 0) { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW); }
-  else            { digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH); speed = -speed; }
+  if (speed >= 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    speed = -speed;
+  }
   analogWrite(PWMA, constrain(speed, 0, 255));
 }
 
 void rightMotor(int speed) {
-  if (speed >= 0) { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW); }
-  else            { digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH); speed = -speed; }
+  if (speed >= 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    speed = -speed;
+  }
   analogWrite(PWMB, constrain(speed, 0, 255));
 }
 
@@ -131,16 +146,30 @@ void stopMotors() {
 }
 
 // ===== Recovery patterns =====
-void sharpLeftTurn()  { leftMotor(-200); rightMotor(200); }
-void sharpRightTurn() { leftMotor(200);  rightMotor(-200); }
+void sharpLeftTurn() {
+  leftMotor(-200);
+  rightMotor(200);
+}
+void sharpRightTurn() {
+  leftMotor(200);
+  rightMotor(-200);
+}
 
-void fastLeftSearch()  { leftMotor(50);  rightMotor(200); }
-void fastRightSearch() { leftMotor(200); rightMotor(50);  }
+void fastLeftSearch() {
+  leftMotor(50);
+  rightMotor(200);
+}
+void fastRightSearch() {
+  leftMotor(200);
+  rightMotor(50);
+}
 
 // ===== Main LF logic (normalized + stable PID) =====
-void executeLineFollowing()
-{
-  if (!robotRunning) { stopMotors(); return; }
+void executeLineFollowing() {
+  if (!robotRunning) {
+    stopMotors();
+    return;
+  }
 
   unsigned long now = millis();
 
@@ -155,9 +184,9 @@ void executeLineFollowing()
       currentPosition = pos;
 
       // update last turn bias from side dominance
-      if (pos < CENTER_POS - 0.5f)      lastTurnDirection = -1;
+      if (pos < CENTER_POS - 0.5f) lastTurnDirection = -1;
       else if (pos > CENTER_POS + 0.5f) lastTurnDirection = +1;
-      else                              lastTurnDirection = 0;
+      else lastTurnDirection = 0;
 
       inRecoveryMode = false;
     } else {
@@ -180,7 +209,7 @@ void executeLineFollowing()
       }
 
       float dt = PID_INTERVAL / 1000.0f;
-      
+
       // Integral control (currently disabled to avoid windup)
       if (Ki > 0) {
         integral += error * dt;
@@ -191,7 +220,7 @@ void executeLineFollowing()
       if (Kd > 0) {
         derivative = (error - lastError) / dt;
       }
-      
+
       float rawCorrection = Kp * error + Ki * integral + Kd * derivative;
 
       // clamp correction to prevent oscillation
@@ -199,50 +228,70 @@ void executeLineFollowing()
       lastError = error;
 
       // Motor speeds - keep both motors mostly forward
-      int leftSpeed  = currentSpeed + (int)correction;
+      int leftSpeed = currentSpeed + (int)correction;
       int rightSpeed = currentSpeed - (int)correction;
 
       // Thrust mixing (BLDC via DShot) - REDUCED for smoother operation
       float thrustAdj = (correction / 100.0f) * THRUST_ADJUSTMENT_FACTOR;  // REDUCED divisor
-      float leftThrust  = constrain(BASE_THRUST + thrustAdj, MIN_THRUST, MAX_THRUST);
+      float leftThrust = constrain(BASE_THRUST + thrustAdj, MIN_THRUST, MAX_THRUST);
       float rightThrust = constrain(BASE_THRUST - thrustAdj, MIN_THRUST, MAX_THRUST);
 
       setThrustValues(leftThrust, rightThrust);
 
-      leftMotor(constrain(leftSpeed,  -255, 255));
+      leftMotor(constrain(leftSpeed, -255, 255));
       rightMotor(constrain(rightSpeed, -255, 255));
     } else {
       // === Recovery/Search when line lost ===
-      if (!inRecoveryMode) { inRecoveryMode = true; recoveryStartTime = now; }
+      if (!inRecoveryMode) {
+        inRecoveryMode = true;
+        recoveryStartTime = now;
+      }
 
       unsigned long timeSinceLoss = now - lineDetectedTime;
 
       if (timeSinceLoss < 2000) {
         // Use last turn memory to bias
         if (lastTurnDirection == -1) {
-          if (timeSinceLoss < 500) {
+          if (timeSinceLoss < 200) {
+            // Small corrective left nudge
+            leftMotor(-50);
+            rightMotor(120);
+            setThrustValues(MIN_THRUST * 0.8f, MAX_THRUST * 0.8f);
+          } else if (timeSinceLoss < 600) {
+            // If still lost, then sharper left
             sharpLeftTurn();
             setThrustValues(MIN_THRUST, MAX_THRUST);
           } else {
+            // Fallback fast search
             fastLeftSearch();
             setThrustValues(MIN_THRUST * 1.6f, MAX_THRUST * 0.8f);
           }
         } else if (lastTurnDirection == +1) {
-          if (timeSinceLoss < 500) {
+          if (timeSinceLoss < 200) {
+            // Small corrective right nudge
+            leftMotor(120);
+            rightMotor(-50);
+            setThrustValues(MAX_THRUST * 0.8f, MIN_THRUST * 0.8f);
+          } else if (timeSinceLoss < 600) {
+            // If still lost, then sharper right
             sharpRightTurn();
             setThrustValues(MAX_THRUST, MIN_THRUST);
           } else {
+            // Fallback fast search
             fastRightSearch();
             setThrustValues(MAX_THRUST * 0.8f, MIN_THRUST * 1.6f);
           }
         } else {
           // No bias → try left then right then sweep
           if (timeSinceLoss < 300) {
-            sharpLeftTurn();  setThrustValues(MIN_THRUST * 1.4f, MAX_THRUST * 0.8f);
+            sharpLeftTurn();
+            setThrustValues(MIN_THRUST * 1.4f, MAX_THRUST * 0.8f);
           } else if (timeSinceLoss < 600) {
-            sharpRightTurn(); setThrustValues(MAX_THRUST * 0.8f, MIN_THRUST * 1.4f);
+            sharpRightTurn();
+            setThrustValues(MAX_THRUST * 0.8f, MIN_THRUST * 1.4f);
           } else {
-            fastLeftSearch(); setThrustValues(MIN_THRUST * 1.6f, MAX_THRUST * 0.8f);
+            fastLeftSearch();
+            setThrustValues(MIN_THRUST * 1.6f, MAX_THRUST * 0.8f);
           }
         }
       } else {
@@ -252,7 +301,6 @@ void executeLineFollowing()
         integral = 0;
         currentPosition = CENTER_POS;
       }
-    }
   }
 }
 
@@ -292,7 +340,7 @@ static void run() {
 
 // ===== Thrust helpers =====
 void setThrustValues(float leftThrust, float rightThrust) {
-  thrusterValues[0] = constrain(leftThrust,  MIN_THRUST, MAX_THRUST);
+  thrusterValues[0] = constrain(leftThrust, MIN_THRUST, MAX_THRUST);
   thrusterValues[1] = constrain(rightThrust, MIN_THRUST, MAX_THRUST);
 }
 
@@ -304,7 +352,7 @@ void disableThrusters() {
 // ===== ESC timing (DShot keepalive) =====
 static void runESCTiming(const uint32_t usec) {
   static uint32_t prev;
-  const uint32_t UPDATE_RATE = 50; // Hz
+  const uint32_t UPDATE_RATE = 50;  // Hz
 
   if (usec - prev > 1000000 / UPDATE_RATE) {
     prev = usec;
