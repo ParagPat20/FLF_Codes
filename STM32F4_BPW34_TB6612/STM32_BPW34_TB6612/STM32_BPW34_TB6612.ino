@@ -1,23 +1,19 @@
-// Arduino Line Following Robot - Advanced 2D Control System
-// Dynamic 2D error calculation using curved sensor array geometry
-// Curvature-aware PID control mixing lateral and heading errors
-// Adaptive speed control for optimal cornering performance
+// Arduino Line Following Robot
+// PID control with smart turn detection for 90-degree turns
 // Enhanced edge sensor memory for sharp turn recovery
+// Dynamic throttle system: starts at 140, increases gradually when on line, resets when line lost
+// Adaptive PID: automatically adjusts PID gains based on current throttle for optimal control
 // CURVED SENSOR ARRAY OPTIMIZATION - Enhanced for arc-shaped sensor layout
 
 #include <Arduino.h>
-#include <vector>
-// Forward declarations of structs
-struct PoseError {
-  float e_lat_mm;   // Lateral error in mm (positive = line to the right)
-  float e_yaw_rad;  // Heading error in radians (positive = robot pointing left of line)
-  bool valid;       // True if error calculation is valid
-};
+#include <HardwareSerial.h>
+
+// HardwareSerial instance for calibration output
+HardwareSerial Serial1(USART1);
 
 // ===== CURVED SENSOR ARRAY GEOMETRY =====
 // 7-sensor array: L3, L2, L1, M0(center), R1, R2, R3
 const uint8_t sensorPins[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
-static const uint32_t UPDATE_RATE = 1000;  // Hz (1 ms) - control loop pacing
 
 // Curved sensor array constants
 #define CURVED_WEIGHT_MULTIPLIER 1.0
@@ -36,32 +32,31 @@ struct SensorGeometry {
 // Position values are calculated based on sensor spacing and curve geometry
 const SensorGeometry sensorGeometry[7] = {
   // L3 (leftmost) - position 0
-  { 46.5, 99.27, 6000, 0.0 },
+  {46.5, 99.27, 6000, 0.0},   
   // L2 - position 1000
-  { 23.019, 58.61, 5000, 1000.0 },
+  {23.019, 58.61, 5000, 1000.0}, 
   // L1 - position 2000
-  { 23.019, 40.66, 4000, 2000.0 },
+  {23.019, 40.66, 4000, 2000.0}, 
   // M0 (center) - position 3000
-  { 0.0, 0.0, 3000, 3000.0 },
+  {0.0, 0.0, 3000, 3000.0},      
   // R1 - position 4000
-  { 21.76, -36.69, 2000, 4000.0 },
+  {21.76, -36.69, 2000, 4000.0}, 
   // R2 - position 5000
-  { 40.966, -72.07, 1000, 5000.0 },
+  {40.966, -72.07, 1000, 5000.0}, 
   // R3 (rightmost) - position 6000
-  { 64.0, -111.4, 0, 6000.0 }
+  {64.0, -111.4, 0, 6000.0}      
 };
 
 // Dynamic threshold values - can be updated via web interface
-int sensorThresholds[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
+int sensorThresholds[7] = { 2450, 2700, 3100, 3100, 3100, 3100, 2500 };
 
 // Motor driver pins
-#define PWMA PB7
+#define PWMA PA15
 #define AIN2 PB14
 #define AIN1 PB15
 #define BIN1 PA8
 #define BIN2 PB3
 #define PWMB PB4
-
 
 // LED pin for calibration indication
 #define LED_PIN PC13
@@ -70,23 +65,34 @@ int sensorThresholds[7] = { PA4, PA5, PA6, PA0, PA1, PA2, PA3 };
 #define SAMPLE_INTERVAL 1  // 1ms ultra-fast sensor reading
 #define PID_INTERVAL 1     // 1ms ultra-fast PID for micro-corrections
 
-// ===== 2D ERROR CALCULATION CONSTANTS =====
-#define LOOKAHEAD_DISTANCE 80.0  // mm - lookahead distance for curvature-aware control
-#define CURVATURE_FACTOR 2.5     // Factor for adaptive speed control based on heading error
-#define MIN_SPEED_FACTOR 0.4     // Minimum speed factor (40% of base speed)
-#define MAX_SPEED_FACTOR 1.0     // Maximum speed factor (100% of base speed)
-
 // ===== PID VARIABLES =====
-// Fixed PID values optimized for curved array with 2D control
-float Kp = 0.15;         // Proportional gain (increased for 2D control)
-float Ki = 0.030;        // Integral gain (increased for better tracking)
-float Kd = 0.08;         // Derivative gain (increased for stability)
-int baseSpeed = 200;     // Base speed (will be modulated by adaptive speed control)
-int currentSpeed = 200;  // Current adaptive speed
+// Curved array optimized PID values - enhanced for better turn detection and precision
+float baseKp = 0.04;  // Slightly higher response for curved array's better turn detection
+float baseKi = 0.012; // Slightly higher to eliminate offset with curved geometry
+float baseKd = 0.02;  // Slightly higher damping for smoother curved path following
+
+// PID values for maximum throttle (250) - optimized for curved array high-speed performance
+float maxKp = baseKp;  // Higher proportional gain for curved array's enhanced precision
+float maxKi = baseKi;  // Higher integral gain for curved array stability
+float maxKd = baseKd;  // Higher derivative gain for curved array's smoother control
+
+// Current adaptive PID values (will be calculated based on throttle)
+float Kp, Ki, Kd;
+int baseSpeed = 220;  // Starting base speed - will be managed by throttle
+
+// ===== THROTTLE VARIABLES =====
+int currentThrottle = 220;                    // Current throttle level (starts at base)
+int MIN_THROTTLE = 220;                       // Minimum throttle (base speed) - now updatable
+int MAX_THROTTLE = 255;                       // Maximum throttle limit - now updatable
+int THROTTLE_INCREMENT = 15;                  // Speed increase per step - now updatable
+unsigned long THROTTLE_INTERVAL = 150;        // 150ms between throttle increases - now updatable
+unsigned long lastThrottleTime = 0;
+unsigned long onLineStartTime = 0;
+bool wasOnLine = false;
 
 // ===== CONTROL PARAMETERS =====
-int MAX_CORRECTION = 400;  // Maximum steering correction
-int ERROR_DEADBAND = 10;   // Deadband to reduce wobbling on straight paths
+int MAX_CORRECTION = 600;  // Increased for more responsive steering - now updatable
+int ERROR_DEADBAND = 8;    // Reduced deadband for better responsiveness - now updatable
 
 float error = 0, lastError = 0, integral = 0;
 unsigned long lastPidTime = 0;
@@ -98,13 +104,24 @@ unsigned long lineDetectedTime = 0;
 float currentPosition = 3000;  // Center position for 7-sensor array (sensor 3, PA0)
 int sampleCount = 0;
 
-// ===== DOTTED LINE DETECTION VARIABLES =====
-bool inDottedLineMode = false;                  // Flag to indicate if robot is in dotted line traversal mode
-unsigned long dottedLineStartTime = 0;          // Timestamp when dotted line mode was entered
-unsigned long lastLineDetectionTime = 0;        // Timestamp of the last successful line detection
-int dottedLineForwardCount = 0;                 // Counter for how many forward steps taken in dotted line mode
-const int MAX_DOTTED_FORWARD_STEPS = 40;        // Maximum steps to move forward before giving up (prevents going too far off course)
-const unsigned long DOTTED_LINE_TIMEOUT = 800;  // 800ms timeout - if no line found within this time, exit dotted line mode
+// ===== ENHANCED DOTTED LINE DETECTION VARIABLES =====
+bool inDottedLineMode = false;                    // Flag to indicate if robot is in dotted line traversal mode
+unsigned long dottedLineStartTime = 0;            // Timestamp when dotted line mode was entered
+unsigned long lastLineDetectionTime = 0;          // Timestamp of the last successful line detection
+int dottedLineForwardCount = 0;                   // Counter for how many forward steps taken in dotted line mode
+const int MAX_DOTTED_FORWARD_STEPS = 10000;          // Increased for dotted line curves
+const unsigned long DOTTED_LINE_TIMEOUT = 1200;   // Increased timeout for complex dotted line patterns
+
+// Enhanced dotted line detection
+bool lastDottedLinePattern = false;               // Track if we were in dotted line mode recently
+unsigned long dottedLinePatternCount = 0;         // Count consecutive dotted line patterns
+const int DOTTED_LINE_PATTERN_THRESHOLD = 3;      // Minimum patterns to confirm dotted line
+const unsigned long PATTERN_RESET_TIME = 2000;    // Time to reset pattern counter
+
+// Intersection detection
+bool intersectionDetected = false;                 // Flag for T-junctions or intersections
+unsigned long lastIntersectionTime = 0;           // When intersection was last detected
+const unsigned long INTERSECTION_MEMORY_TIME = 1500; // How long to remember intersection
 
 // ===== SMART TURN VARIABLES =====
 bool leftEdgeDetected = false;    // Sensor 0 detected black
@@ -115,143 +132,238 @@ int lastTurnDirection = 0;        // -1 = left, 1 = right, 0 = straight
 bool inRecoveryMode = false;      // Currently trying to recover line
 unsigned long recoveryStartTime = 0;
 
-// ===== ROBOT STATE VARIABLES =====
-bool robotRunning = true;  // Robot running state
-// Boot timestamp for delayed start of control loop
-unsigned long bootTime = 0;
 
-// ===== 2D ERROR CALCULATION FUNCTIONS =====
-PoseError calculate2DError() {
-  PoseError result = { 0.0, 0.0, false };
 
+// ===== ROBOT CONTROL VARIABLES =====
+volatile bool robotRunning = true;  // Default state is START
+
+// ===== PID ADAPTATION FUNCTIONS =====
+void updateAdaptivePID() {
+  // Calculate throttle ratio (0.0 = MIN_THROTTLE, 1.0 = MAX_THROTTLE)
+  float throttleRatio = (float)(currentThrottle - MIN_THROTTLE) / (MAX_THROTTLE - MIN_THROTTLE);
+
+  // Linear interpolation between base and max PID values
+  // At low throttle: use baseKp/Ki/Kd for aggressive corrections
+  // At high throttle: use maxKp/Ki/Kd for smooth, stable control
+  Kp = baseKp + (maxKp - baseKp) * throttleRatio;
+  Ki = baseKi + (maxKi - baseKi) * throttleRatio;
+  Kd = baseKd + (maxKd - baseKd) * throttleRatio;
+}
+
+int getAdaptiveDeadband() {
+  // Increase deadband with throttle for smoother high-speed performance
+  float throttleRatio = (float)(currentThrottle - MIN_THROTTLE) / (MAX_THROTTLE - MIN_THROTTLE);
+  return ERROR_DEADBAND - (int)(throttleRatio * 35);  // 25-40 deadband range
+}
+
+
+// ===== CALIBRATION VARIABLES =====
+#define CALIBRATION_DELAY 15     // Reduced delay for more samples during rotation
+#define CALIBRATION_ROTATION_SPEED 150  // Rotation speed for smooth movement
+bool calibrationComplete = false;
+int sensorMinValues[7] = {4095, 4095, 4095, 4095, 4095, 4095, 4095};  // Start with max ADC value
+int sensorMaxValues[7] = {0, 0, 0, 0, 0, 0, 0};                        // Start with min ADC value
+int calibratedThresholds[7] = {0, 0, 0, 0, 0, 0, 0};                   // Will hold calibrated thresholds
+
+// ===== CALIBRATION FUNCTIONS =====
+void performSensorCalibration() {
+  Serial1.println("=== STARTING SENSOR CALIBRATION ===");
+  Serial1.println("Place robot on white surface (no black line)");
+  Serial1.println("Robot will rotate clockwise for 6 seconds during calibration");
+  Serial1.println("Calibrating in 3 seconds...");
+  
+  // Turn LED ON during calibration
+  digitalWrite(LED_PIN, LOW);
+  
+  // Wait for user to place robot on white surface
+  delay(1000);
+  
+  Serial1.println("Starting clockwise rotation...");
+  
+  // Start clockwise rotation and keep it going for 3 seconds
+  leftMotor(CALIBRATION_ROTATION_SPEED);
+  rightMotor(-CALIBRATION_ROTATION_SPEED);
+  
+  // Take samples while rotating for exactly 3 seconds
+  unsigned long startTime = millis();
+  unsigned long sampleCount = 0;
+  
+  while (millis() - startTime < 6000) {  // Rotate for exactly 6 seconds
+    // Read all sensors
+    for (int sensor = 0; sensor < 7; sensor++) {
+      int value = analogRead(sensorPins[sensor]);
+      
+      // Update min and max values for each sensor
+      if (value < sensorMinValues[sensor]) {
+        sensorMinValues[sensor] = value;
+      }
+      if (value > sensorMaxValues[sensor]) {
+        sensorMaxValues[sensor] = value;
+      }
+    }
+    
+    sampleCount++;
+    
+    // Keep rotating - no direction changes, just continuous clockwise rotation
+    delay(CALIBRATION_DELAY);
+  }
+  
+  // Stop motors after calibration
+  stopMotors();
+  Serial1.println("Calibration rotation complete, stopping motors...");
+  
+  // Calculate calibrated thresholds (middle value between min and max)
+  Serial1.println("Calculating calibrated thresholds...");
+  for (int sensor = 0; sensor < 7; sensor++) {
+    // Calculate threshold as middle value between min and max
+    calibratedThresholds[sensor] = (sensorMinValues[sensor] + sensorMaxValues[sensor]) / 2;
+    
+    // Add a small offset to make detection more reliable
+    // This ensures the threshold is slightly below the middle for better black line detection
+    int offset = (sensorMaxValues[sensor] - sensorMinValues[sensor]) * 0.2;  // 20% offset
+    calibratedThresholds[sensor] -= offset;
+    
+    // Ensure threshold is within valid range
+    calibratedThresholds[sensor] = constrain(calibratedThresholds[sensor], 0, 4095);
+    
+    // Print calibration results for each sensor
+    Serial1.print("Sensor ");
+    Serial1.print(sensor);
+    Serial1.print(": Min=");
+    Serial1.print(sensorMinValues[sensor]);
+    Serial1.print(", Max=");
+    Serial1.print(sensorMaxValues[sensor]);
+    Serial1.print(", Threshold=");
+    Serial1.println(calibratedThresholds[sensor]);
+  }
+  
+  // Update the global sensor thresholds with calibrated values
+  for (int i = 0; i < 7; i++) {
+    sensorThresholds[i] = calibratedThresholds[i];
+  }
+  
+
+  
+  calibrationComplete = true;
+  Serial1.println("=== CALIBRATION COMPLETE ===");
+  Serial1.println("Place robot on black line to test...");
+  Serial1.println("Waiting 3 seconds before starting line following...");
+  
+  // Turn LED OFF after calibration is complete
+  digitalWrite(LED_PIN, HIGH);
+  
+  delay(1000);
+}
+
+void displayCalibrationStatus() {
+  if (calibrationComplete) {
+    Serial1.println("=== CALIBRATION STATUS ===");
+    for (int i = 0; i < 7; i++) {
+      Serial1.print("Sensor ");
+      Serial1.print(i);
+      Serial1.print(": Threshold=");
+      Serial1.print(sensorThresholds[i]);
+      Serial1.print(" (Min=");
+      Serial1.print(sensorMinValues[i]);
+      Serial1.print(", Max=");
+      Serial1.print(sensorMaxValues[i]);
+      Serial1.println(")");
+    }
+    Serial1.println("========================");
+  } else {
+    Serial1.println("Calibration not yet performed!");
+  }
+}
+
+// ===== CURVED SENSOR ARRAY READING FUNCTIONS =====
+float readLinePosition() {
+  float weightedSum = 0;
   float totalWeight = 0;
-  float weightedX = 0;  // Forward direction (mm)
-  float weightedY = 0;  // Lateral direction (mm)
-  int activeCount = 0;
+  int blackCount = 0;
+  bool sensorsDetected[7] = {false, false, false, false, false, false, false};
 
-  // Read all 7 sensors and calculate weighted centroid in 2D
+  // Read all 7 sensors once
   for (int i = 0; i < 7; i++) {
     int value = analogRead(sensorPins[i]);
 
-    // Check if sensor detects black line
-    if (value < sensorThresholds[i]) {
-      activeCount++;
+    // Use fixed threshold for each sensor
+    // Lower values indicate black line (we follow black)
+    if (value < sensorThresholds[i]) {  // black line detected
+      sensorsDetected[i] = true;
+      blackCount++;
 
-      // Convert polar coordinates (distance, angle) to Cartesian (x, y)
-      float angleRad = sensorGeometry[i].angle * PI / 180.0;
-      float x = sensorGeometry[i].distance * cos(angleRad);  // Forward
-      float y = sensorGeometry[i].distance * sin(angleRad);  // Lateral (+ = left)
+      // Apply curved array weighting based on sensor geometry
+      float sensorWeight = sensorGeometry[i].weight;
+      
 
-      // Apply curved array weighting
-      float weight = sensorGeometry[i].weight;
-      if (i == 0 || i == 6) {  // Outer sensors
-        weight *= CURVED_WEIGHT_MULTIPLIER * 1.5;
-      } else if (i == 1 || i == 5) {  // Second outer
-        weight *= CURVED_WEIGHT_MULTIPLIER * 1.2;
-      } else if (i == 2 || i == 4) {  // Inner sensors
-        weight *= CURVED_WEIGHT_MULTIPLIER;
-      }
+      // Use the sensor's position value for weighted calculation
+      weightedSum += sensorGeometry[i].position * sensorWeight;
+      totalWeight += sensorWeight;
 
-      // Accumulate weighted position
-      weightedX += x * weight;
-      weightedY += y * weight;
-      totalWeight += weight;
-
-      // Update edge detection for recovery mode
-      if (i == 0 || i == 1) {
+      // Enhanced edge sensor detection for curved array
+      if (i == 0 || i == 1) {  // Leftmost sensors (L3, L2) - more sensitive due to curve
         leftEdgeDetected = true;
         leftEdgeTime = millis();
       }
-      if (i == 5 || i == 6) {
+      if (i == 5 || i == 6) {  // Rightmost sensors (R2, R3) - more sensitive due to curve
         rightEdgeDetected = true;
         rightEdgeTime = millis();
+      }
+      
+      // Enhanced intersection detection for curved array
+      // Check for multiple sensors detecting line simultaneously (potential intersection)
+      if (blackCount >= 3) {
+        // Multiple sensors active - could be intersection or wide line
+        if (blackCount >= 4) {
+          intersectionDetected = true;
+          lastIntersectionTime = millis();
+        }
       }
     }
   }
 
-  // Calculate errors if we have valid sensor data
-  if (activeCount > 0 && totalWeight > 0) {
-    // Calculate weighted centroid
-    float centroidX = weightedX / totalWeight;
-    float centroidY = weightedY / totalWeight;
-
-    // Lateral error: positive when line is to the right of robot center
-    result.e_lat_mm = -centroidY;  // Negative because sensor Y+ is left, but we want line-right to be positive
-
-    // Heading error: angle between robot heading and line direction
-    // Use atan2 to get angle from robot center to line centroid
-    result.e_yaw_rad = atan2(centroidY, centroidX + 50.0);  // +50mm accounts for sensor array being ahead of robot center
-
-    result.valid = true;
-  }
-
-  return result;
-}
-
-// Legacy function for compatibility (now uses 2D calculation)
-float readLinePosition() {
-
-  // Use 2D error calculation and convert to legacy position format
-  PoseError poseError = calculate2DError();
-
-  if (poseError.valid) {
-    // Convert lateral error back to position scale (0-6000)
-    // Lateral error of 0 = center position (3000)
-    // Positive lateral error (line to right) = position > 3000
-    // Negative lateral error (line to left) = position < 3000
-    float position = CURVED_ARRAY_CENTER - (poseError.e_lat_mm * 10.0);  // Scale factor for compatibility
-    return constrain(position, 0, 6000);
+  // Return position if we detected black line, otherwise return -1 to indicate no line
+  if (blackCount > 0) {
+    // Calculate weighted average position for curved array
+    float averagePosition = weightedSum / totalWeight;
+    
+    // Apply curved array correction factor based on detected sensors
+    float correctionFactor = 1.0;
+    
+    // If outer sensors are detected, apply curve correction
+    if (sensorsDetected[0] || sensorsDetected[6]) {  // L3 or R3 detected
+      correctionFactor = 1.15;  // Boost position calculation for outer curve
+    } else if (sensorsDetected[1] || sensorsDetected[5]) {  // L2 or R2 detected
+      correctionFactor = 1.08;  // Moderate boost for inner curve
+    }
+    
+    return averagePosition * correctionFactor;
   } else {
     return -1;  // No line detected
   }
 }
 
-// ===== ADAPTIVE SPEED CONTROL FUNCTIONS =====
-void updateAdaptiveSpeed(float headingError) {
-  // Calculate speed reduction factor based on heading error magnitude
-  float absHeadingError = fabs(headingError);
-  float speedFactor = 1.0 / (1.0 + CURVATURE_FACTOR * absHeadingError);
-
-  // Constrain speed factor to reasonable range
-  speedFactor = constrain(speedFactor, MIN_SPEED_FACTOR, MAX_SPEED_FACTOR);
-
-  // Update current speed
-  currentSpeed = (int)(baseSpeed * speedFactor);
-}
-
-// ===== CURVATURE-AWARE PID CONTROL =====
-float calculateMixedError(const PoseError& poseError) {
-  // Mix lateral and heading errors with lookahead distance
-  // error = e_lat_mm + L * e_yaw_rad
-  return poseError.e_lat_mm + (LOOKAHEAD_DISTANCE * poseError.e_yaw_rad * 180.0 / PI);  // Convert rad to degrees for scaling
-}
-
 void stopMotors() {
-  // Stop motors and set escval to 0.0 for complete stop
   leftMotor(0);
   rightMotor(0);
 }
 
 void sharpLeftTurn() {
-  // Sharp left turn - set escval for aggressive turning (effective range 0.4-0.9)
   leftMotor(-200);  // Maximum reverse left motor
   rightMotor(200);  // Maximum forward right motor
 }
 
 void sharpRightTurn() {
-  // Sharp right turn - set escval for aggressive turning (effective range 0.4-0.9)
   leftMotor(200);    // Maximum forward left motor
   rightMotor(-200);  // Maximum reverse right motor
 }
 
 void fastLeftSearch() {
-  // Fast left search - set escval for quick search pattern (effective range 0.4-0.9)
   leftMotor(50);    // Slow forward left
   rightMotor(200);  // Fast forward right
 }
 
 void fastRightSearch() {
-  // Fast right search - set escval for quick search pattern (effective range 0.4-0.9)
   leftMotor(200);  // Fast forward left
   rightMotor(50);  // Slow forward right
 }
@@ -286,25 +398,26 @@ void rightMotor(int speed) {
 // ===== MAIN LINE FOLLOWING LOGIC =====
 void executeLineFollowing() {
   // If robot is stopped, just stop motors and return
-  if (!robotRunning) {
+  if(!robotRunning) {
     stopMotors();
     return;
   }
-
+  
+  // Ensure LED is OFF during line following
+  digitalWrite(LED_PIN, HIGH);
+  
   unsigned long currentTime = millis();
 
-  // Read sensors and calculate 2D error at regular intervals
-  PoseError poseError = { 0.0, 0.0, false };
+  // Read sensors at regular intervals
   if (currentTime - lastSampleTime >= SAMPLE_INTERVAL) {
     lastSampleTime = currentTime;
 
-    // Get 2D pose error from curved sensor array
-    poseError = calculate2DError();
+    // Get line position with multiple readings
+    float rawPosition = readLinePosition();
 
-    if (poseError.valid) {
-      // Line detected - update position for legacy compatibility
-      currentPosition = CURVED_ARRAY_CENTER - (poseError.e_lat_mm * 10.0);
-      currentPosition = constrain(currentPosition, 0, 6000);
+    if (rawPosition >= 0) {
+      // Line detected - use direct position
+      currentPosition = rawPosition;
       lineDetected = true;
       lineDetectedTime = currentTime;
       lastLineDetectionTime = currentTime;  // Track when we last detected line (for dotted line detection)
@@ -322,36 +435,53 @@ void executeLineFollowing() {
     if (lineDetected && (currentTime - lineDetectedTime) < 100) {
       // Line is detected - normal PID control
       inRecoveryMode = false;
+      
+             // Reset dotted line mode if we were in it
+       // This ensures clean state when we successfully find the line again
+       if (inDottedLineMode) {
+         inDottedLineMode = false;        // Exit dotted line mode
+         dottedLineForwardCount = 0;      // Reset the step counter for next time
+         
+         // Track successful dotted line completion
+         lastDottedLinePattern = true;
+         dottedLinePatternCount++;
+         
+         // Reset pattern counter if too much time has passed
+         if ((currentTime - lastLineDetectionTime) > PATTERN_RESET_TIME) {
+           dottedLinePatternCount = 0;
+         }
+       }
 
-      // Reset dotted line mode if we were in it
-      // This ensures clean state when we successfully find the line again
-      if (inDottedLineMode) {
-        inDottedLineMode = false;    // Exit dotted line mode
-        dottedLineForwardCount = 0;  // Reset the step counter for next time
+      // ===== THROTTLE MANAGEMENT =====
+      // Track when robot gets on line
+      if (!wasOnLine) {
+        onLineStartTime = currentTime;
+        wasOnLine = true;
       }
 
-      // Use new 2D error calculation for curvature-aware control
-      if (poseError.valid) {
-        // Calculate mixed error combining lateral and heading components
-        error = calculateMixedError(poseError);
-
-        // Update adaptive speed based on heading error (curvature)
-        updateAdaptiveSpeed(poseError.e_yaw_rad);
-
-        // Apply deadband to reduce jitter from small errors
-        if (abs(error) < ERROR_DEADBAND) {
-          error = 0;     // Ignore very small errors
-          integral = 0;  // Reset integral when centered
+      // Gradually increase throttle if robot has been on line long enough
+      if (wasOnLine && (currentTime - onLineStartTime) >= THROTTLE_INTERVAL && (currentTime - lastThrottleTime) >= THROTTLE_INTERVAL) {
+        if (currentThrottle < MAX_THROTTLE) {
+          currentThrottle += THROTTLE_INCREMENT;
+          lastThrottleTime = currentTime;
+          updateAdaptivePID();  // Update PID values for new throttle
         }
-
-        // Update turn direction memory based on lateral error
-        if (poseError.e_lat_mm < -20.0) lastTurnDirection = -1;     // Line on left
-        else if (poseError.e_lat_mm > 20.0) lastTurnDirection = 1;  // Line on right
-      } else {
-        // Fallback to legacy position-based error if 2D calculation fails
-        error = CURVED_ARRAY_CENTER - currentPosition;
-        currentSpeed = baseSpeed;  // Use base speed as fallback
       }
+
+      // Calculate error from center position for curved array (3000 = exactly at sensor M0, PA0)
+      // Curved array provides better precision for turns, so we can use more aggressive error calculation
+      error = CURVED_ARRAY_CENTER - currentPosition;
+
+      // Apply adaptive deadband to reduce jitter from small errors
+      int currentDeadband = getAdaptiveDeadband();
+      if (abs(error) < currentDeadband) {
+        error = 0;     // Ignore very small errors
+        integral = 0;  // Reset integral when centered
+      }
+
+      // Update turn direction memory based on current position for curved array
+      if (currentPosition < 1500) lastTurnDirection = -1;      // Left turn (line on left side)
+      else if (currentPosition > 4500) lastTurnDirection = 1;  // Right turn (line on right side)
 
       // PID calculations with time-based integral
       float deltaTime = PID_INTERVAL / 1000.0;  // Convert to seconds
@@ -368,28 +498,31 @@ void executeLineFollowing() {
 
       lastError = error;
 
-      // PID control with adaptive speed based on curvature
-      int leftSpeed = currentSpeed - correction;
-      int rightSpeed = currentSpeed + correction;
+      // Normal PID control with forward motion using dynamic throttle
+      int leftSpeed = currentThrottle - correction;
+      int rightSpeed = currentThrottle + correction;
 
-      // No ESC control: only DC motor speeds are applied
+      // Allow full range of motor speeds for responsive control
+      // Full reverse capability for sharp turns
+      leftSpeed = constrain(leftSpeed, -255, 255);
+      rightSpeed = constrain(rightSpeed, -255, 255);
 
       // Apply motor speeds with constraints
-      leftMotor(constrain(leftSpeed, -255, 255));
-      rightMotor(constrain(rightSpeed, -255, 255));
+      leftMotor(leftSpeed);
+      rightMotor(rightSpeed);
 
     } else {
       // No line detected - check for dotted line pattern first
       // This is the key improvement: instead of immediately turning when line is lost,
       // we first check if this might be a dotted line (brief white space)
       handleDottedLineMode();
-
+      
       // If we're in dotted line mode, skip normal recovery
       // The dotted line handler is managing the robot's movement
       if (inDottedLineMode) {
         return;  // Continue with dotted line mode - don't enter normal recovery
       }
-
+      
       // No line detected and not in dotted line mode - enter normal recovery mode
       // This handles cases where the line is truly lost (not just a dotted line gap)
       if (!inRecoveryMode) {
@@ -397,15 +530,38 @@ void executeLineFollowing() {
         recoveryStartTime = currentTime;
       }
 
+      // ===== THROTTLE RESET =====
+      // Reset throttle when line is lost (after the 100ms grace period)
+      if (wasOnLine) {
+        currentThrottle = MIN_THROTTLE;  // Reset to base speed
+        wasOnLine = false;               // Mark as off-line
+        updateAdaptivePID();             // Update PID values for reset throttle
+      }
 
-
-      // Check if we should attempt recovery based on navigation data or edge sensor memory
+            // Check if we should attempt recovery based on edge sensor memory
       unsigned long timeSinceLoss = currentTime - lineDetectedTime;
 
-      if (timeSinceLoss < 2000) {  // Within 2000ms window for recovery
+      if (timeSinceLoss < 2000) {  // Within 2000ms window for traditional recovery
+         
+         // Enhanced intersection handling
+         if (intersectionDetected && (currentTime - lastIntersectionTime) < INTERSECTION_MEMORY_TIME) {
+           // Near intersection - use gentle search pattern
+           if (timeSinceLoss < 200) {
+             // Small corrective movement
+             if (lastTurnDirection == -1) {
+               leftMotor(-30); rightMotor(80);
+             } else if (lastTurnDirection == 1) {
+               leftMotor(80); rightMotor(-30);
+             } else {
+               leftMotor(50); rightMotor(50); // Forward
+             }
+           } else {
+             // Continue with normal recovery
+           }
+         }
         // Enhanced edge sensor memory recovery for curved array
         // Curved array provides better edge detection, so we can extend the memory window
-        bool recentLeftEdge = leftEdgeDetected && (currentTime - leftEdgeTime) < 500;     // Extended from 300ms
+        bool recentLeftEdge = leftEdgeDetected && (currentTime - leftEdgeTime) < 500;  // Extended from 300ms
         bool recentRightEdge = rightEdgeDetected && (currentTime - rightEdgeTime) < 500;  // Extended from 300ms
 
         if (recentLeftEdge && !recentRightEdge) {
@@ -440,38 +596,75 @@ void executeLineFollowing() {
             fastLeftSearch();  // Then search left while moving
           }
         }
-      } else {
-        // Recovery timeout - stop and reset
-        // No ESCs: only stop DC motors
-        stopMotors();
-        integral = 0;
-        currentPosition = CURVED_ARRAY_CENTER;  // Reset to center position for curved array
-        leftEdgeDetected = false;
-        rightEdgeDetected = false;
-      }
+             } else {
+         // Recovery timeout - stop and reset
+         stopMotors();
+         integral = 0;
+         currentPosition = CURVED_ARRAY_CENTER;  // Reset to center position for curved array
+         leftEdgeDetected = false;
+         rightEdgeDetected = false;
+         
+         // Reset intersection detection after timeout
+         if ((currentTime - lastIntersectionTime) > INTERSECTION_MEMORY_TIME) {
+           intersectionDetected = false;
+         }
+       }
     }
   }
 }
 
+// ===== CURVED ARRAY OPTIMIZATION FUNCTIONS =====
+void calculateCurvedArrayParameters() {
+  // Calculate optimal parameters based on curved array geometry
+  // This function can be called during setup or when parameters need updating
+  
+  // Adjust error deadband based on curved array precision
+  // Curved array provides better precision, so we can use smaller deadband
+  ERROR_DEADBAND = 8;  // Reduced from 10 for better curved array response
+  
+  // Adjust max correction based on curved array's enhanced turn detection
+  MAX_CORRECTION = 600;  // Increased for more responsive curved array control
+  
+  // Adjust throttle parameters for curved array performance
+  THROTTLE_INCREMENT = 15;  // Increased for faster acceleration with curved array
+  THROTTLE_INTERVAL = 150;  // Reduced for more responsive curved array control
+}
 
-
-// ===== DOTTED LINE DETECTION FUNCTION =====
+// ===== ENHANCED DOTTED LINE DETECTION FUNCTION =====
 bool detectDottedLinePattern() {
   // This function identifies the characteristic pattern of dotted lines:
   // Line detected → Brief white space → Line detected again
-
-  // Check if we recently had line detection (within last 200ms)
-  // This indicates we just lost the line after having it, which is typical of dotted lines
+  
   unsigned long currentTime = millis();
-  bool recentlyHadLine = (currentTime - lastLineDetectionTime) < 200;
-
-  // If we had line recently and now lost it, this might be a dotted line
-  // The 200ms window is chosen because dotted line gaps are typically short
+  bool recentlyHadLine = (currentTime - lastLineDetectionTime) < 300; // Increased window for curves
+  
+  // Pattern 1: Recent line loss (basic dotted line)
   if (recentlyHadLine && !lineDetected) {
-    return true;  // This looks like a dotted line pattern
+    return true;
   }
-
-  return false;  // Not a dotted line pattern
+  
+  // Pattern 2: Intersection detection (multiple sensors active)
+  if (intersectionDetected && (currentTime - lastIntersectionTime) < INTERSECTION_MEMORY_TIME) {
+    return true;
+  }
+  
+  // Pattern 3: Curved dotted line pattern (extended gaps)
+  if (lastDottedLinePattern && (currentTime - lastLineDetectionTime) < 500) {
+    dottedLinePatternCount++;
+    if (dottedLinePatternCount >= DOTTED_LINE_PATTERN_THRESHOLD) {
+      return true;
+    }
+  }
+  
+  // Pattern 4: Edge sensor memory (line near edges)
+  bool recentLeftEdge = leftEdgeDetected && (currentTime - leftEdgeTime) < 400;
+  bool recentRightEdge = rightEdgeDetected && (currentTime - rightEdgeTime) < 400;
+  
+  if ((recentLeftEdge || recentRightEdge) && !lineDetected) {
+    return true;
+  }
+  
+  return false; // Not a dotted line pattern
 }
 
 // ===== FORWARD-LOOKING LINE DETECTION =====
@@ -479,59 +672,82 @@ void handleDottedLineMode() {
   // This function manages the robot's behavior when traversing dotted lines
   // Instead of immediately turning when line is lost, it continues forward
   // to check if there's a line ahead (which is typical of dotted lines)
-
+  
   unsigned long currentTime = millis();
-
+  
   // STEP 1: Check if we should enter dotted line mode
   // Only enter if we're not already in it and we detect a dotted line pattern
   if (!inDottedLineMode && detectDottedLinePattern()) {
-    inDottedLineMode = true;            // Set the mode flag
-    dottedLineStartTime = currentTime;  // Record when we entered this mode
-    dottedLineForwardCount = 0;         // Reset the forward step counter
+    inDottedLineMode = true;                    // Set the mode flag
+    dottedLineStartTime = currentTime;          // Record when we entered this mode
+    dottedLineForwardCount = 0;                 // Reset the forward step counter
+    Serial1.println("Entering dotted line mode - continuing forward");
   }
-
+  
   // STEP 2: Handle behavior while in dotted line mode
   if (inDottedLineMode) {
     // EXIT CONDITION 1: Check if we found line again
     // This is the success case - we found the line after the gap
     if (lineDetected) {
-      inDottedLineMode = false;  // Exit dotted line mode
-      return;                    // Skip normal recovery mode
+      inDottedLineMode = false;                 // Exit dotted line mode
+      Serial1.println("Line found - exiting dotted line mode");
+      return;                                   // Skip normal recovery mode
     }
-
+    
     // EXIT CONDITION 2: Check if we've been in dotted line mode too long
     // This prevents the robot from going too far if there's no line ahead
     if ((currentTime - dottedLineStartTime) > DOTTED_LINE_TIMEOUT) {
-      inDottedLineMode = false;  // Exit dotted line mode
-      return;                    // Fall back to normal recovery
+      inDottedLineMode = false;                 // Exit dotted line mode
+      Serial1.println("Dotted line timeout - entering recovery mode");
+      return;                                   // Fall back to normal recovery
     }
-
+    
     // EXIT CONDITION 3: Check if we've moved forward enough steps
     // This prevents the robot from going too far off course
     if (dottedLineForwardCount >= MAX_DOTTED_FORWARD_STEPS) {
-      inDottedLineMode = false;  // Exit dotted line mode
-      return;                    // Fall back to normal recovery
+      inDottedLineMode = false;                 // Exit dotted line mode
+      Serial1.println("Max forward steps reached - entering recovery mode");
+      return;                                   // Fall back to normal recovery
     }
-
+    
     // STEP 3: Continue forward movement in dotted line mode
-    dottedLineForwardCount++;  // Increment the step counter
-
-    // Use last known position to maintain direction
-    // This keeps the robot moving in the same direction it was going before losing the line
+    dottedLineForwardCount++;                   // Increment the step counter
+    
+    // Enhanced direction prediction for dotted line curves
     float lastKnownError = CURVED_ARRAY_CENTER - currentPosition;
-    float correction = constrain(lastKnownError * 0.5, -200, 200);  // Reduced correction (50% of normal)
-
-    // No ESCs in dotted line mode; maintain DC motor forward motion
-
-    // Set forward speed slightly above base for controlled movement
-    int forwardSpeed = baseSpeed + 20;           // Base speed + 20 for steady forward motion
-    int leftSpeed = forwardSpeed - correction;   // Apply correction to left motor
-    int rightSpeed = forwardSpeed + correction;  // Apply correction to right motor
-
-    // Apply motor speeds with safety constraints
-    leftMotor(constrain(leftSpeed, 0, 255));    // Ensure speed is within valid range
-    rightMotor(constrain(rightSpeed, 0, 255));  // Ensure speed is within valid range
-
+    
+    // Adaptive correction based on dotted line pattern
+    float correctionFactor = 0.6; // Start with moderate correction
+    
+    // Increase correction for curved dotted lines
+    if (dottedLinePatternCount >= DOTTED_LINE_PATTERN_THRESHOLD) {
+      correctionFactor = 0.8; // More aggressive for confirmed dotted line curves
+    }
+    
+    // Special handling for intersections
+    if (intersectionDetected && (currentTime - lastIntersectionTime) < 500) {
+      correctionFactor = 0.4; // Gentle correction near intersections
+    }
+    
+    float correction = constrain(lastKnownError * correctionFactor, -250, 250);
+    
+    // Adaptive forward speed based on pattern complexity
+    int forwardSpeed = MIN_THROTTLE + 15; // Slightly reduced for better control
+    
+    // Increase speed for straight dotted lines, reduce for curves
+    if (abs(lastKnownError) < 500) { // Straight ahead
+      forwardSpeed += 10;
+    } else { // Curved path
+      forwardSpeed -= 5;
+    }
+    
+    int leftSpeed = forwardSpeed - correction;
+    int rightSpeed = forwardSpeed + correction;
+    
+    // Apply motor speeds with full range capability
+    leftMotor(constrain(leftSpeed, -255, 255));
+    rightMotor(constrain(rightSpeed, -255, 255));
+    
     return;  // Skip normal recovery mode - we're handling this ourselves
   }
 }
@@ -551,26 +767,32 @@ void setup() {
 
   // Initialize LED pin
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);  // Turn LED on to indicate ready
+  digitalWrite(LED_PIN, LOW);  // Turn LED on to indicate ready
 
-  // Brief startup delay
+  // Initialize Serial1 for calibration output
+  Serial1.begin(115200);
+  
+  // Wait for system to be ready
   delay(1000);
-  // Record boot time for delayed control start
-  bootTime = millis();
+  
+  // Perform sensor calibration on boot
+  performSensorCalibration();
+  
+  // Display calibration results
+  displayCalibrationStatus();
+  
+  // Calculate curved array specific parameters
+  calculateCurvedArrayParameters();
+  
+  // Initialize adaptive PID values
+  updateAdaptivePID();
+  
+  Serial1.println("=== ROBOT READY FOR LINE FOLLOWING ===");
+  Serial1.println("Place robot on black line to start...");
 }
-
 
 void loop() {
-  const auto usec = micros();
-
-  // Start running control logic 3 seconds after boot
-  if (millis() - bootTime > 3000) {
-    run();
-  }
-}
-
-
-static void run() {
-
+  // Execute main line following logic
   executeLineFollowing();
+
 }
