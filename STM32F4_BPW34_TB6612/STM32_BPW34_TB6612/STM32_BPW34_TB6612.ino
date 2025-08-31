@@ -67,8 +67,8 @@ int sensorThresholds[7] = { 2450, 2700, 3100, 3100, 3100, 3100, 2500 };
 
 // ===== PID VARIABLES =====
 // Curved array optimized PID values - enhanced for better turn detection and precision
-float baseKp = 0.04;  // Slightly higher response for curved array's better turn detection
-float baseKi = 0.012; // Slightly higher to eliminate offset with curved geometry
+float baseKp = 0.06;  // Slightly higher response for curved array's better turn detection
+float baseKi = 0.2; // Slightly higher to eliminate offset with curved geometry
 float baseKd = 0.02;  // Slightly higher damping for smoother curved path following
 
 // PID values for maximum throttle (250) - optimized for curved array high-speed performance
@@ -431,8 +431,8 @@ void executeLineFollowing() {
   if (currentTime - lastPidTime >= PID_INTERVAL) {
     lastPidTime = currentTime;
 
-    // Check if line was detected recently (within last 100ms)
-    if (lineDetected && (currentTime - lineDetectedTime) < 100) {
+         // Check if line was detected recently (within last 200ms - increased for dashed lines)
+     if (lineDetected && (currentTime - lineDetectedTime) < 200) {
       // Line is detected - normal PID control
       inRecoveryMode = false;
       
@@ -479,9 +479,13 @@ void executeLineFollowing() {
         integral = 0;  // Reset integral when centered
       }
 
-      // Update turn direction memory based on current position for curved array
-      if (currentPosition < 1500) lastTurnDirection = -1;      // Left turn (line on left side)
-      else if (currentPosition > 4500) lastTurnDirection = 1;  // Right turn (line on right side)
+             // Update turn direction memory based on current position for curved array
+       // Only update direction when line is significantly off-center (not just oscillation)
+       if (currentPosition < 1000) lastTurnDirection = -1;      // Left turn (line on left side)
+       else if (currentPosition > 5000) lastTurnDirection = 1;  // Right turn (line on right side)
+       else if (abs(currentPosition - CURVED_ARRAY_CENTER) < 500) {
+         lastTurnDirection = 0;  // Reset to straight when near center
+       }
 
       // PID calculations with time-based integral
       float deltaTime = PID_INTERVAL / 1000.0;  // Convert to seconds
@@ -541,7 +545,7 @@ void executeLineFollowing() {
             // Check if we should attempt recovery based on edge sensor memory
       unsigned long timeSinceLoss = currentTime - lineDetectedTime;
 
-      if (timeSinceLoss < 2000) {  // Within 2000ms window for traditional recovery
+      if (timeSinceLoss < 3000) {  // Extended window for dashed line handling
          
          // Enhanced intersection handling
          if (intersectionDetected && (currentTime - lastIntersectionTime) < INTERSECTION_MEMORY_TIME) {
@@ -565,35 +569,39 @@ void executeLineFollowing() {
         bool recentRightEdge = rightEdgeDetected && (currentTime - rightEdgeTime) < 500;  // Extended from 300ms
 
         if (recentLeftEdge && !recentRightEdge) {
-          // Left edge was detected recently - immediate sharp left turn
-          sharpLeftTurn();
+          // Left edge (L3) detected recently - gentle left turn
+          if (timeSinceLoss < 400) {
+            leftMotor(-40); rightMotor(80);  // Gentle left turn
+          } else {
+            leftMotor(-60); rightMotor(100); // Slightly more aggressive
+          }
           lastTurnDirection = -1;
         } else if (recentRightEdge && !recentLeftEdge) {
-          // Right edge was detected recently - immediate sharp right turn
-          sharpRightTurn();
+          // Right edge (R3) detected recently - gentle right turn
+          if (timeSinceLoss < 400) {
+            leftMotor(80); rightMotor(-40);  // Gentle right turn
+          } else {
+            leftMotor(100); rightMotor(-60); // Slightly more aggressive
+          }
           lastTurnDirection = 1;
-        } else if (lastTurnDirection == -1) {
-          // Continue left turn with forward motion for faster search
-          if (timeSinceLoss < 500) {
-            sharpLeftTurn();  // First 500ms: sharp turn
-          } else {
-            fastLeftSearch();  // After 500ms: search while moving forward
-          }
-        } else if (lastTurnDirection == 1) {
-          // Continue right turn with forward motion for faster search
-          if (timeSinceLoss < 500) {
-            sharpRightTurn();  // First 500ms: sharp turn
-          } else {
-            fastRightSearch();  // After 500ms: search while moving forward
-          }
         } else {
-          // No memory - aggressive search pattern
-          if (timeSinceLoss < 300) {
-            sharpLeftTurn();  // Try left first
-          } else if (timeSinceLoss < 600) {
-            sharpRightTurn();  // Then try right
+          // No edge sensors detected - GO STRAIGHT FORWARD
+          // This prevents unnecessary turning on dashed lines
+          if (timeSinceLoss < 800) {
+            // Continue straight for first 800ms
+            leftMotor(MIN_THROTTLE + 20);
+            rightMotor(MIN_THROTTLE + 20);
+          } else if (lastTurnDirection != 0) {
+            // Only after 800ms, use last known direction for gentle search
+            if (lastTurnDirection == -1) {
+              leftMotor(40); rightMotor(80);  // Gentle left search
+            } else {
+              leftMotor(80); rightMotor(40);  // Gentle right search
+            }
           } else {
-            fastLeftSearch();  // Then search left while moving
+            // No direction memory - continue straight
+            leftMotor(MIN_THROTTLE + 10);
+            rightMotor(MIN_THROTTLE + 10);
           }
         }
              } else {
