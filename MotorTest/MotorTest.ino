@@ -19,7 +19,7 @@ HardwareSerial Serial1(USART1);
 // Motor pins for TB6612
 const int motorA1 = PB15;  // Left motor
 const int motorA2 = PB14;
-const int motorPWMA = PB1;
+const int motorPWMA = PA15;
 
 const int motorB1 = PA8;  // Right motor
 const int motorB2 = PB3;
@@ -179,11 +179,11 @@ void loop() {
 void testLeftMotor(bool forward) {
   stopMotorDrivers();
   if (forward) {
-    digitalWrite(motorA1, LOW);
-    digitalWrite(motorA2, HIGH);
-  } else {
     digitalWrite(motorA1, HIGH);
     digitalWrite(motorA2, LOW);
+  } else {
+    digitalWrite(motorA1, LOW);
+    digitalWrite(motorA2, HIGH);
   }
   analogWrite(motorPWMA, testSpeed);
   delay(testDuration);
